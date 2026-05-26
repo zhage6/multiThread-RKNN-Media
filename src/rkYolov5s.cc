@@ -167,7 +167,14 @@ int rkYolov5s::init(rknn_context *ctx_in, bool share_weight)
         }
         dump_tensor_attr(&(input_attrs[i]));
     }
-
+    input_attrs[0].type = RKNN_TENSOR_UINT8;
+    input_mems[0] = rknn_create_mem(ctx,input_attrs[0].size_with_stride);
+    
+    ret = rknn_set_io_mem(ctx, input_mems[0], &input_attrs[0]);
+    if (ret < 0) {
+        printf("input_mems rknn_set_io_mem fail! ret=%d\n", ret);
+        return -1;
+    }
     // 设置输出参数/Set the output parameters
     output_attrs = (rknn_tensor_attr *)calloc(io_num.n_output, sizeof(rknn_tensor_attr));
     for (int i = 0; i < io_num.n_output; i++)
@@ -193,65 +200,131 @@ int rkYolov5s::init(rknn_context *ctx_in, bool share_weight)
     }
     printf("model input height=%d, width=%d, channel=%d\n", height, width, channel);
 
-    memset(inputs, 0, sizeof(inputs));
-    inputs[0].index = 0;
-    inputs[0].type = RKNN_TENSOR_UINT8;
-    inputs[0].size = width * height * channel;
-    inputs[0].fmt = RKNN_TENSOR_NHWC;
-    inputs[0].pass_through = 0;
+    // memset(inputs, 0, sizeof(inputs));
+    // inputs[0].index = 0;
+    // inputs[0].type = RKNN_TENSOR_UINT8;
+    // inputs[0].size = width * height * channel;
+    // inputs[0].fmt = RKNN_TENSOR_NHWC;
+    // inputs[0].pass_through = 0;
 
     return 0;
+}
+
+int rkYolov5s::GetInputFd()
+{
+    if (input_mems[0] != nullptr) 
+    {
+        return input_mems[0]->fd;
+    }
+    return -1;
 }
 
 rknn_context *rkYolov5s::get_pctx()
 {
     return &ctx;
 }
+/**
+ * @brief 使用 RGA 将 MPP 的 NV12 物理内存，直接转码+缩放至 NPU 的 RGB 物理内存
+ * * @param src_fd       MPP 解码吐出的底层钥匙
+ * @param src_w        原视频真实宽度 (如 1920)
+ * @param src_h        原视频真实高度 (如 1080)
+ * @param src_w_stride MPP 硬件对齐后的宽度步长 (极重要！通常是 256 的整数倍)
+ * @param src_h_stride MPP 硬件对齐后的高度步长
+ * @param dst_fd       RKNN 申请的 NPU 输入内存钥匙
+ * @param dst_w        YOLO 模型的输入宽度 (如 640)
+ * @param dst_h        YOLO 模型的输入高度 (如 640)
+ * @return int         0 表示成功，<0 表示失败
+ */
+int process_rga_zero_copy(int src_fd, int src_w, int src_h, int src_w_stride, int src_h_stride,
+                          int dst_fd, int dst_w, int dst_h) 
+{
+// 1. 包装源内存 (MPP NV12)
+    rga_buffer_t src_img = wrapbuffer_fd(src_fd, src_w, src_h, 
+                                         RK_FORMAT_YCbCr_420_SP, 
+                                         src_w_stride, src_h_stride);
 
-cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
+    // 2. 包装目标内存 (NPU RGB)
+    rga_buffer_t dst_img = wrapbuffer_fd(dst_fd, dst_w, dst_h, 
+                                         RK_FORMAT_RGB_888, 
+                                         dst_w, dst_h);
+
+    // 3. 一键拉伸 + 转码！
+    // RGA 非常聪明，它会自动读取 src 和 dst 里面的宽高和格式，直接完成所有转换
+    
+    IM_STATUS status = imresize(src_img, dst_img);
+        
+    if (status != IM_STATUS_SUCCESS) {
+        printf("RGA 硬件转换失败: %s\n", imStrError(status));
+        return -1;
+    }
+    return 0;
+}
+
+
+
+detect_result_group_t rkYolov5s::infer(input_data data)
 {
     std::lock_guard<std::mutex> lock(mtx);
-    cv::Mat img;
-    cv::cvtColor(orig_img, img, cv::COLOR_BGR2RGB);
-    img_width = img.cols;
-    img_height = img.rows;
 
-    BOX_RECT pads;
-    memset(&pads, 0, sizeof(BOX_RECT));
-    cv::Size target_size(width, height);
-    cv::Mat resized_img(target_size.height, target_size.width, CV_8UC3);
-    // 计算缩放比例/Calculate the scaling ratio
-    float scale_w = (float)target_size.width / img.cols;
-    float scale_h = (float)target_size.height / img.rows;
 
-    // 图像缩放/Image scaling
-    if (img_width != width || img_height != height)
-    {
-        // rga
-        rga_buffer_t src;
-        rga_buffer_t dst;
-        memset(&src, 0, sizeof(src));
-        memset(&dst, 0, sizeof(dst));
-        ret = resize_rga(src, dst, img, resized_img, target_size);
-        if (ret != 0)
-        {
-            fprintf(stderr, "resize with rga error\n");
-        }
-        /*********
-        // opencv
-        float min_scale = std::min(scale_w, scale_h);
-        scale_w = min_scale;
-        scale_h = min_scale;
-        letterbox(img, resized_img, pads, min_scale, target_size);
-        *********/
-        inputs[0].buf = resized_img.data;
-    }
-    else
-    {
-        inputs[0].buf = img.data;
+    int dst_fd = input_mems[0]->fd; 
+
+    // 2. 【核心 0 拷贝动作】：呼叫 RGA！
+    // 将 MPP 的 YUV(src_fd) 直接转码缩放进我的 RGB(dst_fd) 专属模具里
+    int rga_ret = process_rga_zero_copy(
+        data.src_fd, data.width, data.height, data.hor_stride, data.ver_stride,
+        dst_fd, width, height // width 和 height 是 YOLO 模型的 640x640
+    );
+
+    detect_result_group_t detect_result_group;
+    memset(&detect_result_group, 0, sizeof(detect_result_group));
+
+    if (rga_ret != 0) {
+        printf("RGA 搬运失败，丢弃该帧\n");
+        return detect_result_group;
     }
 
-    rknn_inputs_set(ctx, io_num.n_input, inputs);
+    // cv::Mat img;
+    // cv::cvtColor(orig_img, img, cv::COLOR_BGR2RGB);
+    // img_width = img.cols;
+    // img_height = img.rows;
+
+    // BOX_RECT pads;
+    // memset(&pads, 0, sizeof(BOX_RECT));
+    // cv::Size target_size(width, height);
+    // cv::Mat resized_img(target_size.height, target_size.width, CV_8UC3);
+    // // 计算缩放比例/Calculate the scaling ratio
+    // float scale_w = (float)target_size.width / img.cols;
+    // float scale_h = (float)target_size.height / img.rows;
+
+    // // 图像缩放/Image scaling
+    // if (img_width != width || img_height != height)
+    // {
+    //     // rga
+    //     rga_buffer_t src;
+    //     rga_buffer_t dst;
+    //     memset(&src, 0, sizeof(src));
+    //     memset(&dst, 0, sizeof(dst));
+    //     ret = resize_rga(src, dst, img, resized_img, target_size);
+    //     if (ret != 0)
+    //     {
+    //         fprintf(stderr, "resize with rga error\n");
+    //     }
+    //     /*********
+    //     // opencv
+    //     float min_scale = std::min(scale_w, scale_h);
+    //     scale_w = min_scale;
+    //     scale_h = min_scale;
+    //     letterbox(img, resized_img, pads, min_scale, target_size);
+    //     *********/
+    //     inputs[0].buf = resized_img.data;
+    // }
+    // else
+    // {
+    //     inputs[0].buf = img.data;
+    // }
+
+    // rknn_inputs_set(ctx, io_num.n_input, inputs);
 
     rknn_output outputs[io_num.n_output];
     memset(outputs, 0, sizeof(outputs));
@@ -264,8 +337,15 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
     ret = rknn_run(ctx, NULL);
     ret = rknn_outputs_get(ctx, io_num.n_output, outputs, NULL);
 
+    // 计算缩放比例 (模型输入大小 / 原始视频帧大小)
+    float scale_w = (float)width / data.width;
+    float scale_h = (float)height / data.height;
+
+    BOX_RECT pads;
+    memset(&pads, 0, sizeof(BOX_RECT)); // 你原代码没用 letterbox，pad 为 0
+
     // 后处理/Post-processing
-    detect_result_group_t detect_result_group;
+    //detect_result_group_t detect_result_group;
     std::vector<float> out_scales;
     std::vector<int32_t> out_zps;
     for (int i = 0; i < io_num.n_output; ++i)
@@ -276,32 +356,35 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
     post_process((int8_t *)outputs[0].buf, (int8_t *)outputs[1].buf, (int8_t *)outputs[2].buf, height, width,
                  box_conf_threshold, nms_threshold, pads, scale_w, scale_h, out_zps, out_scales, &detect_result_group);
 
-    // 绘制框体/Draw the box
-    char text[256];
-    for (int i = 0; i < detect_result_group.count; i++)
-    {
-        detect_result_t *det_result = &(detect_result_group.results[i]);
-        sprintf(text, "%s %.1f%%", det_result->name, det_result->prop * 100);
-        // 打印预测物体的信息/Prints information about the predicted object
-        // printf("%s @ (%d %d %d %d) %f\n", det_result->name, det_result->box.left, det_result->box.top,
-        //        det_result->box.right, det_result->box.bottom, det_result->prop);
-        int x1 = det_result->box.left;
-        int y1 = det_result->box.top;
-        int x2 = det_result->box.right;
-        int y2 = det_result->box.bottom;
-        rectangle(orig_img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(256, 0, 0, 256), 3);
-        putText(orig_img, text, cv::Point(x1, y1 + 12), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 255));
-    }
+    // // 绘制框体/Draw the box
+    // char text[256];
+    // for (int i = 0; i < detect_result_group.count; i++)
+    // {
+    //     detect_result_t *det_result = &(detect_result_group.results[i]);
+    //     sprintf(text, "%s %.1f%%", det_result->name, det_result->prop * 100);
+    //     // 打印预测物体的信息/Prints information about the predicted object
+    //     // printf("%s @ (%d %d %d %d) %f\n", det_result->name, det_result->box.left, det_result->box.top,
+    //     //        det_result->box.right, det_result->box.bottom, det_result->prop);
+    //     int x1 = det_result->box.left;
+    //     int y1 = det_result->box.top;
+    //     int x2 = det_result->box.right;
+    //     int y2 = det_result->box.bottom;
+    //     rectangle(orig_img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(256, 0, 0, 256), 3);
+    //     putText(orig_img, text, cv::Point(x1, y1 + 12), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 255));
+    // }
 
     ret = rknn_outputs_release(ctx, io_num.n_output, outputs);
 
-    return orig_img;
+    return detect_result_group;
 }
 
 rkYolov5s::~rkYolov5s()
 {
     deinitPostProcess();
-
+    if (input_mems[0] != nullptr) 
+    {
+        rknn_destroy_mem(ctx, input_mems[0]);
+    }
     ret = rknn_destroy(ctx);
 
     if (model_data)

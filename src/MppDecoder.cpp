@@ -15,7 +15,8 @@ MppDecoder::~MppDecoder() {
 
 
 // --- 初始化解码器 ---
-bool MppDecoder::Init(FrameCallback callback, MppCodingType type) {
+bool MppDecoder::Init(FrameCallback callback, MppCodingType type) 
+{
     m_callback = callback;
     m_type = type;
 

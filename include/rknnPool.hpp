@@ -5,9 +5,7 @@
 #include <vector>
 #include <iostream>
 #include <mutex>
-#include <queue>
-#include <memory>
-
+#include <queue> 
 // rknnModel模型类, inputType模型输入类型, outputType模型输出类型
 template <typename rknnModel, typename inputType, typename outputType>
 class rknnPool

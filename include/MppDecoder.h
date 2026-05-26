@@ -46,9 +46,11 @@ public:
     // 2. 核心数据输入接口：无论是读本地文件还是网络推流，拿到 H264 裸流直接往这里喂
     void DecodePacket(const uint8_t* data, size_t size);
 
-private:
     // 内部处理：处理硬件解码循环
     void FlushDecoder();
+
+private:
+  
     
     // 内部处理：动态分配 24 块外部 DMA 内存池（Mode 3 核心）
     int AllocateExternalBuffers(size_t buf_size, int width, int height);
