@@ -1,7 +1,6 @@
 #include <stdio.h>
 #include <mutex>
 #include "rknn_api.h"
-
 #include "postprocess.h"
 #include "preprocess.h"
 
@@ -262,7 +261,7 @@ int process_rga_zero_copy(int src_fd, int src_w, int src_h, int src_w_stride, in
 
 
 
-detect_result_group_t rkYolov5s::infer(input_data data)
+InferOutput rkYolov5s::infer(input_data data)
 {
     std::lock_guard<std::mutex> lock(mtx);
 
@@ -276,12 +275,32 @@ detect_result_group_t rkYolov5s::infer(input_data data)
         dst_fd, width, height // width 和 height 是 YOLO 模型的 640x640
     );
 
+    // 2. OpenCV 提取原图并做色彩转换
+    cv::Mat bgr_original;
+    if (rga_ret == 0 && data.frame != nullptr) {
+        MppBuffer buffer = mpp_frame_get_buffer(data.frame);
+        void* mpp_va = mpp_buffer_get_ptr(buffer);
+
+        // 使用对齐跨距构造 YUV，再裁剪成真实尺寸，最后转为 BGR
+        cv::Mat yuv_aligned(data.ver_stride * 3 / 2, data.hor_stride, CV_8UC1, mpp_va);
+        cv::Mat yuv_cropped = yuv_aligned(cv::Rect(0, 0, data.width, data.height * 3 / 2));
+        cv::cvtColor(yuv_cropped, bgr_original, cv::COLOR_YUV2BGR_NV12);
+    }
+
+
+    if (data.frame != nullptr) {
+        mpp_frame_deinit(&data.frame); //归还frame
+        data.frame = nullptr;
+    }
+    
+
     detect_result_group_t detect_result_group;
     memset(&detect_result_group, 0, sizeof(detect_result_group));
-
+    InferOutput out;
     if (rga_ret != 0) {
         printf("RGA 搬运失败，丢弃该帧\n");
-        return detect_result_group;
+        out.results = detect_result_group;
+        return out;
     }
 
     // cv::Mat img;
@@ -373,9 +392,23 @@ detect_result_group_t rkYolov5s::infer(input_data data)
     //     putText(orig_img, text, cv::Point(x1, y1 + 12), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 255));
     // }
 
-    ret = rknn_outputs_release(ctx, io_num.n_output, outputs);
+    // 5. 画框 (画在刚转出来的 bgr_original 上)
+    if (!bgr_original.empty()) {
+        for (int i = 0; i < detect_result_group.count; i++) {
+            auto& res = detect_result_group.results[i];
+            cv::rectangle(bgr_original, cv::Point(res.box.left, res.box.top), 
+                          cv::Point(res.box.right, res.box.bottom), cv::Scalar(0, 255, 0), 2);
+            std::string label = "Class " + std::string(res.name);
+            cv::putText(bgr_original, label, cv::Point(res.box.left, res.box.top - 5), 
+                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
+        }
+    }
 
-    return detect_result_group;
+    ret = rknn_outputs_release(ctx, io_num.n_output, outputs);
+    out.results = detect_result_group;
+    out.image = bgr_original;
+
+    return out;
 }
 
 rkYolov5s::~rkYolov5s()

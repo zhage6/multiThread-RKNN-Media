@@ -1,9 +1,10 @@
 #include "MppDecoder.h"
+#include <unistd.h>
 #include <iostream>
 
 // --- 构造函数：全部初始化为空 ---
 MppDecoder::MppDecoder() : 
-    m_ctx(nullptr), m_mpi(nullptr), m_packet(nullptr), m_frm_grp(nullptr),
+    m_ctx(nullptr), m_mpi(nullptr), m_frm_grp(nullptr),
     m_initialized(false), m_src_width(0), m_src_height(0) 
 {
 }
@@ -40,9 +41,9 @@ bool MppDecoder::Init(FrameCallback callback, MppCodingType type)
     }
 
     // 4. 创建一个空的 Packet 壳子（不分配内存，实现输入端 0 拷贝）
-    if (mpp_packet_init(&m_packet, nullptr, 0) != MPP_OK) {
-        return false;
-    }
+    // if (mpp_packet_init(&m_packet, nullptr, 0) != MPP_OK) {
+    //     return false;
+    // }
 
     m_initialized = true;
     std::cout << "MPP 硬件解码器初始化成功！" << std::endl;
@@ -52,10 +53,10 @@ bool MppDecoder::Init(FrameCallback callback, MppCodingType type)
 // --- 清理函数：释放所有硬件和 DMA 内存 ---
 void MppDecoder::ReleaseAll() {
     // 1. 释放 MPP 数据包壳子
-    if (m_packet) {
-        mpp_packet_deinit(&m_packet);
-        m_packet = nullptr;
-    }
+    // if (m_packet) {
+    //     mpp_packet_deinit(&m_packet);
+    //     m_packet = nullptr;
+    // }
     // 2. 销毁 MPP 解码器硬件上下文
     if (m_ctx) {
         mpp_destroy(m_ctx);
@@ -130,21 +131,51 @@ int MppDecoder::AllocateExternalBuffers(size_t buf_size, int width, int height) 
 }
 
 // --- 核心加工接口：处理每一包 H.264 数据 ---
-void MppDecoder::DecodePacket(const uint8_t* data, size_t size) {
+void MppDecoder::DecodePacket(const uint8_t* data, size_t size) 
+{
     if (!m_initialized || !data || size == 0) return;
 
-    // 1. 输入端 0 拷贝：将 packet 外壳直接套在外部传进来的内存上
-    mpp_packet_set_data(m_packet, (void*)data);
-    mpp_packet_set_size(m_packet, size);
-    mpp_packet_set_pos(m_packet, (void*)data);
-    mpp_packet_set_length(m_packet, size);
+    MppPacket packet = nullptr;
+    mpp_packet_init(&packet, (void*)data, size);
+    mpp_packet_set_pos(packet, (void*)data);
+    mpp_packet_set_length(packet, size);
 
-    // 塞进硬件
-    if (m_mpi->decode_put_packet(m_ctx, m_packet) == MPP_OK) 
+    // ==========================================
+    // 核心修复：加入背压重试机制（防止 CPU 把硬件撑爆）
+    // ==========================================
+    MPP_RET ret = MPP_OK;
+    int retry_count = 0;
+    
+    do 
     {
-        // 塞进去之后，立刻呼叫 Flush 去取货
+        // 尝试把快递单塞进硬件队列
+        ret = m_mpi->decode_put_packet(m_ctx, packet);
+        
+        if (ret == MPP_OK) {
+            break; // 塞包成功，顺利跳出循环！
+        }
+        
+        // 如果走到这里，说明硬件返回了失败（大概率是 MPP_ERR_BUFFER_FULL）
+        // 应对策略：强迫硬件去消费（Flush），腾出肚子，稍微等一下，然后重试！
+        FlushDecoder(); 
+        usleep(2000); // 挂起当前 CPU 线程 2 毫秒，不要死循环空转
+        
+        retry_count++;
+        if (retry_count > 200)
+        {
+            // 如果等了 400 毫秒还没塞进去，说明硬件彻底卡死了
+            std::cerr << "致命错误：解码器严重卡死，塞包连续超时！" << std::endl;
+            break; 
+        }
+    } while (ret != MPP_OK);
+
+    // 塞包成功后，例行呼叫一次取货
+    if (ret == MPP_OK) {
         FlushDecoder(); 
     }
+
+    // 硬件接管了数据后，释放当前线程的局部外壳
+    mpp_packet_deinit(&packet);
 }
 
 void MppDecoder::FlushDecoder() 
@@ -171,7 +202,6 @@ void MppDecoder::FlushDecoder()
                     AllocateExternalBuffers(mpp_frame_get_buf_size(frame), m_hor_stride, m_ver_stride);
                 }
                 
-                mpp_buffer_group_limit_config(m_frm_grp, mpp_frame_get_buf_size(frame), 24); 
                 m_mpi->control(m_ctx, MPP_DEC_SET_EXT_BUF_GROUP, m_frm_grp);
                 m_mpi->control(m_ctx, MPP_DEC_SET_INFO_CHANGE_READY, nullptr);
             } 
@@ -179,13 +209,17 @@ void MppDecoder::FlushDecoder()
             else if (mpp_frame_get_errinfo(frame) == 0 && mpp_frame_get_discard(frame) == 0) {
                 int src_fd = mpp_buffer_get_fd(mpp_frame_get_buffer(frame));
                 if (m_callback) {
-                    m_callback(src_fd, m_src_width, m_src_height, m_hor_stride, m_ver_stride);
+                    m_callback(src_fd, m_src_width, m_src_height, m_hor_stride, m_ver_stride, frame);
                 }
             }
 
-            // 归还帧引用
-            mpp_frame_deinit(&frame);
-            frame = nullptr;
+            // // 归还帧引用
+            // mpp_frame_deinit(&frame); //不能立马释放
+            // frame = nullptr;
+            else 
+            {
+                mpp_frame_deinit(&frame); // 废废帧当场释放
+            }
         }
     }
 }

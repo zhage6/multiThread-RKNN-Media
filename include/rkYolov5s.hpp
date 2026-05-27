@@ -5,6 +5,7 @@
 #include <mutex>
 #include "opencv2/core/core.hpp"
 #include "postprocess.h"
+#include "MppDecoder.h"
 
 static void dump_tensor_attr(rknn_tensor_attr *attr);
 static unsigned char *load_data(FILE *fp, size_t ofst, size_t sz);
@@ -17,6 +18,13 @@ struct input_data
     int height;       // 原图高
     int hor_stride;   // 宽步长
     int ver_stride;   // 高步长
+    MppFrame frame;
+};
+
+struct InferOutput 
+{
+    detect_result_group_t results; // 目标检测结果
+    cv::Mat image;                 // 画好框的高清原图
 };
 
 class rkYolov5s
@@ -46,7 +54,7 @@ public:
     int init(rknn_context *ctx_in, bool isChild);
     rknn_context *get_pctx();
     //cv::Mat infer(cv::Mat &ori_img);
-    detect_result_group_t infer(input_data data);
+    InferOutput infer(input_data data);
     ~rkYolov5s();
 };
 

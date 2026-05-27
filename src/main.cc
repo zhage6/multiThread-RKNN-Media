@@ -25,7 +25,8 @@ int main(int argc, char **argv)
 
     // 初始化rknn线程池/Initialize the rknn thread pool
     int threadNum = 3;
-    rknnPool<rkYolov5s, input_data, detect_result_group_t> testPool(model_name, threadNum);
+    int in_flight_frames = 0;
+    rknnPool<rkYolov5s, input_data, InferOutput> testPool(model_name, threadNum);
     if (testPool.init() != 0)
     {
         printf("rknnPool init fail!\n");
@@ -34,10 +35,11 @@ int main(int argc, char **argv)
     MppDecoder decoder;
     decoder.Init(
     // ========== 第 1 个参数：Lambda 回调函数 ==========
-    [&](int src_fd, int width, int height, int hor_stride, int ver_stride) {
+    [&](int src_fd, int width, int height, int hor_stride, int ver_stride, MppFrame frame) {
         // 这里是 Lambda 的函数体 (注意有大括号 {})
-        input_data data = {src_fd, width, height, hor_stride, ver_stride};
+        input_data data = {src_fd, width, height, hor_stride, ver_stride, frame};
         testPool.put(data); 
+        in_flight_frames++;
     }, // <-- 注意这里有一个逗号！用来分隔第一个和第二个参数
 
     // ========== 第 2 个参数：视频编码类型 ==========
@@ -49,13 +51,14 @@ int main(int argc, char **argv)
         return -1;
     }
     unsigned char buffer[4096]; // 每次给解码器喂 4KB 的压缩数据包
-    int frames_sent = 0;        // 记录丢进线程池的总帧数
 
     printf("流水线全速启动...\n");
 
     // ==========================================
     // 4. 极限狂飙主循环
     // ==========================================
+    cv::VideoWriter writer;
+    bool is_writer_init = false;
     while (!feof(fp)) {
         // A. 读一包压缩字节流
         size_t bytes_read = fread(buffer, 1, sizeof(buffer), fp);
@@ -63,33 +66,54 @@ int main(int argc, char **argv)
             // B. 塞进解码器肚子，并强制它消化
             // 解码器内部如果攒够了一帧，就会自动触发上面的 Lambda 回调
             decoder.DecodePacket(buffer, bytes_read);
-            decoder.FlushDecoder(); 
+            //decoder.FlushDecoder(); 
         }
 
         // C. 滑动窗口阻塞机制 (防止 MPP 解码太快，撑爆内存)
         // 你的原版经典保命逻辑：只要队列里的任务超过了线程数，就必须先拿走一个结果才准继续放
-        if (frames_sent >= threadNum) {
-            detect_result_group_t results;
-            if (testPool.get(results) == 0) 
+        if (in_flight_frames >= threadNum) 
+        {
+            InferOutput out;
+            if (testPool.get(out) == 0) 
             {
+                in_flight_frames--;
                 // 成功拿到了 NPU 的检测结果！
-                printf("第帧处理完毕！检测到 %d 个目标。\n", results.count);
+                //printf("第帧处理完毕！检测到 %d 个目标。\n", results.count);
                 // 这里你可以打印坐标：results.results[0].box.left 等
                 // 【注意】：因为是 0 拷贝，此时你手里没有 cv::Mat 图片，无法直接用 imshow 画框！
                 // 真正的生产环境，这里通常是把坐标打成 JSON 发给后端，或者配合 DRM/VO 直接在屏幕上画 UI 框。
+                if (!out.image.empty()) {
+                    // 懒加载初始化 VideoWriter
+                    if (!is_writer_init) {
+                        writer.open("result.mp4", cv::VideoWriter::fourcc('m', 'p', '4', 'v'), 
+                                    25.0, cv::Size(out.image.cols, out.image.rows));
+                        is_writer_init = true;
+                    }
+                    // 完美顺序写入！
+                    writer.write(out.image);
+                }
+                printf("一帧处理并写入完毕！检测到 %d 个目标。\n", out.results.count);
             }
         }
-        
-        frames_sent++;
     }
     detect_result_group_t results;
-    while (testPool.get(results) == 0) {
-        printf("收尾排空队列... 检测到 %d 个目标。\n", results.count);
+    while (in_flight_frames > 0) {
+        InferOutput out;
+        if (testPool.get(out) == 0) 
+        {   
+            in_flight_frames--;
+            if (is_writer_init && !out.image.empty()) {
+                writer.write(out.image);
+            }
+            printf("收尾排空队列... 检测到 %d 个目标。\n", out.results.count);
+        }
     }
-
+    if (writer.isOpened()) {
+        writer.release();
+    }
+    printf("处理完成，结果已保存为 result.mp4\n");
     fclose(fp);
     printf("全链路运行结束！\n");
-
     
 
 

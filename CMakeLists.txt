@@ -28,6 +28,7 @@ set(RGA_LIB ${RGA_PATH}/lib/Linux//${LIB_ARCH}/librga.so)
 
 #mpp
 set(MPP_PATH /usr/include/rockchip)
+set(MPP_LIB /usr/lib/aarch64-linux-gnu/librockchip_mpp.so)
 
 
 
@@ -62,7 +63,7 @@ target_link_libraries(rknn_yolov5_demo
   ${RKNN_RT_LIB}
   ${OpenCV_LIBS}
   ${RGA_LIB}
-  rockchip_mpp
+  ${MPP_LIB}
 )
 
 
@@ -71,4 +72,5 @@ set(CMAKE_INSTALL_PREFIX ${CMAKE_SOURCE_DIR}/install/rknn_yolov5_demo_${CMAKE_SY
 install(TARGETS rknn_yolov5_demo DESTINATION ./)
 install(PROGRAMS ${RKNN_RT_LIB} DESTINATION lib)
 install(PROGRAMS ${RGA_LIB} DESTINATION lib)
+install(PROGRAMS ${MPP_LIB} DESTINATION lib)
 install(DIRECTORY model DESTINATION ./)
