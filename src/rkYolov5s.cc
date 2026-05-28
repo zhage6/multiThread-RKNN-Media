@@ -297,9 +297,12 @@ InferOutput rkYolov5s::infer(input_data data)
     detect_result_group_t detect_result_group;
     memset(&detect_result_group, 0, sizeof(detect_result_group));
     InferOutput out;
+    out.channel_id = data.channel_id; // 贴上通道标签
+    out.frame_id = data.frame_id;     // 贴上序号标签
     if (rga_ret != 0) {
         printf("RGA 搬运失败，丢弃该帧\n");
         out.results = detect_result_group;
+        out.frame_id = -1;     // 贴上序号标签
         return out;
     }
 
@@ -407,7 +410,6 @@ InferOutput rkYolov5s::infer(input_data data)
     ret = rknn_outputs_release(ctx, io_num.n_output, outputs);
     out.results = detect_result_group;
     out.image = bgr_original;
-
     return out;
 }
 

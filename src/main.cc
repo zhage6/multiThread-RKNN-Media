@@ -10,10 +10,13 @@
 #include "rknnPool.hpp"
 #include "postprocess.h"
 #include "MppDecoder.h"
+#include "StreamChannel.h"
+
+
 int main(int argc, char **argv)
 {
     char *model_name = NULL;
-    if (argc != 3)
+    if (argc != 2)
     {
         printf("Usage: %s <rknn model> <jpg> \n", argv[0]);
         return -1;
@@ -21,9 +24,10 @@ int main(int argc, char **argv)
     // 参数二，模型所在路径/The path where the model is located
     model_name = (char *)argv[1];
     // 参数三, 视频/摄像头
-    char *video_path = argv[2];
+    // char *video_path = argv[2];
 
     // 初始化rknn线程池/Initialize the rknn thread pool
+    std::atomic<int> active_channels{2};
     int threadNum = 3;
     int in_flight_frames = 0;
     rknnPool<rkYolov5s, input_data, InferOutput> testPool(model_name, threadNum);
@@ -32,149 +36,100 @@ int main(int argc, char **argv)
         printf("rknnPool init fail!\n");
         return -1;
     }
-    MppDecoder decoder;
-    decoder.Init(
-    // ========== 第 1 个参数：Lambda 回调函数 ==========
-    [&](int src_fd, int width, int height, int hor_stride, int ver_stride, MppFrame frame) {
-        // 这里是 Lambda 的函数体 (注意有大括号 {})
-        input_data data = {src_fd, width, height, hor_stride, ver_stride, frame};
-        testPool.put(data); 
-        in_flight_frames++;
-    }, // <-- 注意这里有一个逗号！用来分隔第一个和第二个参数
+    std::vector<std::shared_ptr<VideoChannel>> channels;
+    channels.push_back(std::make_unique<VideoChannel>(0, "../test.h264", &testPool,active_channels));
+    channels.push_back(std::make_unique<VideoChannel>(1, "../test2.h264", &testPool,active_channels));
 
-    // ========== 第 2 个参数：视频编码类型 ==========
-        MPP_VIDEO_CodingAVC
-    );
-    FILE* fp = fopen(video_path, "rb");
-    if (!fp) {
-        printf("打开视频文件失败！请检查路径。\n");
-        return -1;
+    for (auto& ch : channels) 
+    {
+        ch->start();
     }
-    unsigned char buffer[4096]; // 每次给解码器喂 4KB 的压缩数据包
-
-    printf("流水线全速启动...\n");
+    printf("4路视频解码流水线全速启动...\n");
+    printf("主线程开始接收推理结果并写入 MP4...\n");
 
     // ==========================================
-    // 4. 极限狂飙主循环
+    // 1. 定义多路视频写入器和重排缓冲区
     // ==========================================
-    cv::VideoWriter writer;
-    bool is_writer_init = false;
-    while (!feof(fp)) {
-        // A. 读一包压缩字节流
-        size_t bytes_read = fread(buffer, 1, sizeof(buffer), fp);
-        if (bytes_read > 0) {
-            // B. 塞进解码器肚子，并强制它消化
-            // 解码器内部如果攒够了一帧，就会自动触发上面的 Lambda 回调
-            decoder.DecodePacket(buffer, bytes_read);
-            //decoder.FlushDecoder(); 
-        }
-
-        // C. 滑动窗口阻塞机制 (防止 MPP 解码太快，撑爆内存)
-        // 你的原版经典保命逻辑：只要队列里的任务超过了线程数，就必须先拿走一个结果才准继续放
-        if (in_flight_frames >= threadNum) 
-        {
-            InferOutput out;
-            if (testPool.get(out) == 0) 
-            {
-                in_flight_frames--;
-                // 成功拿到了 NPU 的检测结果！
-                //printf("第帧处理完毕！检测到 %d 个目标。\n", results.count);
-                // 这里你可以打印坐标：results.results[0].box.left 等
-                // 【注意】：因为是 0 拷贝，此时你手里没有 cv::Mat 图片，无法直接用 imshow 画框！
-                // 真正的生产环境，这里通常是把坐标打成 JSON 发给后端，或者配合 DRM/VO 直接在屏幕上画 UI 框。
-                if (!out.image.empty()) {
-                    // 懒加载初始化 VideoWriter
-                    if (!is_writer_init) {
-                        writer.open("result.mp4", cv::VideoWriter::fourcc('m', 'p', '4', 'v'), 
-                                    25.0, cv::Size(out.image.cols, out.image.rows));
-                        is_writer_init = true;
-                    }
-                    // 完美顺序写入！
-                    writer.write(out.image);
-                }
-                printf("一帧处理并写入完毕！检测到 %d 个目标。\n", out.results.count);
-            }
-        }
-    }
-    detect_result_group_t results;
-    while (in_flight_frames > 0) {
-        InferOutput out;
-        if (testPool.get(out) == 0) 
-        {   
-            in_flight_frames--;
-            if (is_writer_init && !out.image.empty()) {
-                writer.write(out.image);
-            }
-            printf("收尾排空队列... 检测到 %d 个目标。\n", out.results.count);
-        }
-    }
-    if (writer.isOpened()) {
-        writer.release();
-    }
-    printf("处理完成，结果已保存为 result.mp4\n");
-    fclose(fp);
-    printf("全链路运行结束！\n");
+    // 存放每个通道对应的 OpenCV VideoWriter
+    std::map<int, cv::VideoWriter> writers;
     
+    // 存放每个通道当前期待写入的“下一帧序号”（严格保证顺序）
+    std::map<int, uint64_t> expected_frame_ids;
+    
+    // 重排缓冲区：存放那些“提前算完但还轮不到它写入”的帧
+    // 结构: map<通道号, map<帧序号, 图像Mat>>
+    std::map<int, std::map<uint64_t, cv::Mat>> reorder_buffers;
 
+    // ==========================================
+    // 2. 主循环：全速拉取与精准分发写入
+    // ==========================================
+    while (true) 
+    {
+        if(active_channels == 0)
+            break;
+        InferOutput out;
+        
+        // 阻塞获取 NPU 池子里的处理结果
+        if (testPool.get(out) == 0 ) 
+        {
+            if(out.frame_id == -1)
+            {
+                // 这是一帧搬运失败的特殊标记，直接丢弃，不进入重排逻辑
+                printf("收到一帧搬运失败的结果，已丢弃！\n");
+                continue;
+            }
+            int cid = out.channel_id;
+            uint64_t fid = out.frame_id;
+            
+            // 【首次初始化该通道的录像机】
+            if (writers.find(cid) == writers.end()) {
+                std::string filename = "result_channel_" + std::to_string(cid) + ".mp4";
+                // 注意：这里需要确保 out.image 不为空，且宽高正确
+                writers[cid].open(filename, cv::VideoWriter::fourcc('m', 'p', '4', 'v'), 
+                                  25.0, cv::Size(out.image.cols, out.image.rows));
+                
+                // 初始化该通道期待的第一帧序号
+                expected_frame_ids[cid] = 0; // 假设你的帧号是从 0 开始的
+                printf("通道 %d 的录像机已启动！\n", cid);
+            }
 
-    // cv::namedWindow("Camera FPS");
-    // // cv::VideoCapture capture;
-    // // if (strlen(vedio_name) == 1)
-    // //     capture.open((int)(vedio_name[0] - '0'));
-    // // else
-    // //     capture.open(vedio_name);
-    // FILE* fp = fopen(video_path, "rb");
-    // if (!fp) {
-    //     printf("打开视频文件失败！请检查路径。\n");
-    //     return -1;
-    // }
+            // 【将当前帧放入该通道的重排缓冲区】
+            // (注意：这里假设 out.image 是独立内存，如果用的是浅拷贝，需要 out.image.clone())
+            reorder_buffers[cid][fid] = out.image.clone();
 
-    // struct timeval time;
-    // gettimeofday(&time, nullptr);
-    // auto startTime = time.tv_sec * 1000 + time.tv_usec / 1000;
+            // 【顺序消费逻辑】：检查缓冲区里有没有当前期待的那一帧
+            while (reorder_buffers[cid].count(expected_frame_ids[cid]) > 0) 
+            {
+                uint64_t current_expected = expected_frame_ids[cid];
+                
+                // 1. 拿出来写入 MP4
+                writers[cid].write(reorder_buffers[cid][current_expected]);
+                
+                // 2. 写入完毕，从缓冲区销毁，释放内存
+                reorder_buffers[cid].erase(current_expected);
+                
+                // 3. 期待值 + 1，准备写下一帧！
+                expected_frame_ids[cid]++;
+                
+                // 如果恰好后面几帧（比如 101, 102）早就等在缓冲区里了，
+                // 这个 while 循环会一次性把它们全部顺畅地写进去！
+            
+            }
+            printf("目前通道%d缓存区已经缓存了%d帧等待写入\n", cid, (int)reorder_buffers[cid].size());
+            // 【防爆内存保护】如果某个通道的一帧丢失了(导致后面的帧一直卡在缓冲区写不进去)
+            // 设定一个阈值，如果积压超过 30 帧，强制跳过丢失的帧
+            if (reorder_buffers[cid].size() > 20) {
+                printf("警告：通道 %d 出现严重丢帧！强制向前推进序号。\n", cid);
+                // 把期待帧号强制设置为缓冲区里最小的那个帧号
+                expected_frame_ids[cid] = reorder_buffers[cid].begin()->first;
+            }
+        }
+    }
 
-    // int frames = 0;
-    // auto beforeTime = startTime;
-    // while (capture.isOpened())
-    // {
-    //     cv::Mat img;
-    //     if (capture.read(img) == false)
-    //         break;
-    //     if (testPool.put(img) != 0)
-    //         break;
-
-    //     if (frames >= threadNum && testPool.get(img) != 0) //都使用了引用机制,没事
-    //         break;
-    //     cv::imshow("Camera FPS", img);
-    //     if (cv::waitKey(1) == 'q') // 延时1毫秒,按q键退出/Press q to exit
-    //         break;
-    //     frames++;
-
-    //     if (frames % 120 == 0)
-    //     {
-    //         gettimeofday(&time, nullptr);
-    //         auto currentTime = time.tv_sec * 1000 + time.tv_usec / 1000;
-    //         printf("120帧内平均帧率:\t %f fps/s\n", 120.0 / float(currentTime - beforeTime) * 1000.0);
-    //         beforeTime = currentTime;
-    //     }
-    // }
-
-    // // 清空rknn线程池/Clear the thread pool
-    // while (true)
-    // {
-    //     cv::Mat img;
-    //     if (testPool.get(img) != 0)
-    //         break;
-    //     cv::imshow("Camera FPS", img);
-    //     if (cv::waitKey(1) == 'q') // 延时1毫秒,按q键退出/Press q to exit
-    //         break;
-    //     frames++;
-    // }
-
-    // gettimeofday(&time, nullptr);
-    // auto endTime = time.tv_sec * 1000 + time.tv_usec / 1000;
-
-    // printf("Average:\t %f fps/s\n", float(frames) / float(endTime - startTime) * 1000.0);
+    // 释放资源...
+    for (auto& pair : writers) {
+        pair.second.release();
+    }
 
     return 0;
 }

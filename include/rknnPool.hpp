@@ -30,6 +30,12 @@ public:
     int put(inputType inputData);
     // 获取推理结果/Get the results of your inference
     int get(outputType &outputData);
+    int get_task_size() 
+    {
+        std::lock_guard<std::mutex> lock(queueMtx); 
+        return futs.size();                  
+    }
+    
     ~rknnPool();
 };
 
