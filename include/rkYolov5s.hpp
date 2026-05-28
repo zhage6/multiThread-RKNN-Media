@@ -19,12 +19,18 @@ struct input_data
     int hor_stride;   // 宽步长
     int ver_stride;   // 高步长
     MppFrame frame;
+    // ======== 多路框架新增 ========
+    int channel_id;      // 标记是哪一路视频
+    uint64_t frame_id;   // 标记这路视频的第几帧 (用来排序)
+
 };
 
 struct InferOutput 
 {
     detect_result_group_t results; // 目标检测结果
     cv::Mat image;                 // 画好框的高清原图
+    int channel_id;      // 标记是哪一路视频
+    uint64_t frame_id;   // 标记这路视频的第几帧 (用来排序)
 };
 
 class rkYolov5s
