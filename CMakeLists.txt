@@ -57,6 +57,7 @@ add_executable(rknn_yolov5_demo
         src/rkYolov5s.cc
         src/MppDecoder.cpp
         src/dma_alloc.cpp
+        src/MppEncoder.cpp
 )
 
 target_link_libraries(rknn_yolov5_demo

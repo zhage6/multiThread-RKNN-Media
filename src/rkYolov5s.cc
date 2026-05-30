@@ -277,7 +277,8 @@ InferOutput rkYolov5s::infer(input_data data)
 
     // 2. OpenCV 提取原图并做色彩转换
     cv::Mat bgr_original;
-    if (rga_ret == 0 && data.frame != nullptr) {
+    if (rga_ret == 0 && data.frame != nullptr) 
+    {
         MppBuffer buffer = mpp_frame_get_buffer(data.frame);
         void* mpp_va = mpp_buffer_get_ptr(buffer);
 
