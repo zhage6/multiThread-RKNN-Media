@@ -20,6 +20,7 @@ class RkMppEncoder {
 public:
     RkMppEncoder();
     ~RkMppEncoder();
+    MppBuffer GetFreeBuffer();
 
     // 1. 初始化编码器 (设置宽高、像素格式、编码格式 H264/H265 等)
     bool Init(int width, int height, MppFrameFormat fmt, MppCodingType type);

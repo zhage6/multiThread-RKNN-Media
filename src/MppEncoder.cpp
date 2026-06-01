@@ -1,4 +1,5 @@
 #include "MppEncoder.h"
+#include <rockchip/mpp_debug.h>
 RkMppEncoder::RkMppEncoder() 
     : ctx_(nullptr), 
       mpi_(nullptr), 
@@ -107,6 +108,8 @@ bool RkMppEncoder::PushBuffer(MppBuffer buffer)
     // 设置常规参数
     mpp_frame_set_width(frame, width_);
     mpp_frame_set_height(frame, height_);
+    mpp_frame_set_hor_stride(frame, width_);
+    mpp_frame_set_ver_stride(frame, height_);
     mpp_frame_set_fmt(frame, fmt_); // 如 MPP_FMT_YUV420SP
     
     // 绑定已经带有画框数据的物理内存
@@ -116,7 +119,7 @@ bool RkMppEncoder::PushBuffer(MppBuffer buffer)
     mpi_->encode_put_frame(ctx_, frame);
 
     // 销毁 Frame 外壳
-    mpp_frame_deinit(&frame);
+    // mpp_frame_deinit(&frame);
     return true;
 }
 
@@ -124,20 +127,24 @@ void RkMppEncoder::OutputThreadFunc()
 {
     MppPacket packet = nullptr;
 
-    while (is_running_) {
+    while (is_running_) 
+    {
         // 尝试从硬件获取码流包
         MPP_RET ret = mpi_->encode_get_packet(ctx_, &packet);
         
-        if (ret == MPP_OK && packet != nullptr) {
+        if (ret == MPP_OK && packet != nullptr) 
+        {
             // 1. 提取数据并触发回调
             void* data = mpp_packet_get_pos(packet);
             size_t size = mpp_packet_get_length(packet);
             
             // 判断是否是 I 帧
             uint32_t flags = mpp_packet_get_flag(packet);
+            printf("\n>>> [输出线程] 收到硬件码流包! 长度: %zu 字节, flags: 0x%08x\n", size, flags);
             bool is_keyframe = (flags & MPP_PACKET_FLAG_INTRA) ? true : false;
             
-            if (on_packet_ready_) {
+            if (on_packet_ready_) 
+            {
                 on_packet_ready_((const uint8_t*)data, size, is_keyframe);
             }
 
@@ -147,21 +154,55 @@ void RkMppEncoder::OutputThreadFunc()
             
             if (MPP_OK == mpp_meta_get_frame(meta, KEY_INPUT_FRAME, &orig_frame)) 
             {
+                mpp_assert(orig_frame);
                 MppBuffer used_buffer = mpp_frame_get_buffer(orig_frame);
-                
+                printf("一帧码流准备好了，正在回收物理 Buffer...\n");
                 // 放回空闲池并唤醒阻塞的 PushFrame
                 {
                     std::lock_guard<std::mutex> lock(mtx_);
                     free_buffers_.push(used_buffer);
                 }
                 cv_.notify_one(); 
-                
+                printf("一帧编码完成，已回收物理 Buffer,唤醒等待的线程\n");
                 mpp_frame_deinit(&orig_frame);
             }
-
+            printf("警告：无法找到原始输入帧，可能导致内存泄漏！\n");
             // 销毁包描述符
             mpp_packet_deinit(&packet);
-        } else {
+            // if (flags & MPP_PACKET_FLAG_EXTRA_DATA) 
+            // {
+            //     // 这是配置参数头，不需要回收 Buffer
+            //     printf("收到 SPS/PPS 头信息包，正常放行。\n");
+            // } 
+            // else 
+            // {
+            //     // 正常的视频数据包，执行回收闭环
+            //     MppMeta meta = mpp_packet_get_meta(packet);
+            //     MppFrame orig_frame = nullptr;
+                
+            //     // 确保 meta 存在，且成功取到了输入帧
+            //     if (meta != nullptr && MPP_OK == mpp_meta_get_frame(meta, KEY_INPUT_FRAME, &orig_frame)) 
+            //     {
+            //         MppBuffer used_buffer = mpp_frame_get_buffer(orig_frame);
+                    
+            //         {
+            //             std::lock_guard<std::mutex> lock(mtx_);
+            //             free_buffers_.push(used_buffer);
+            //         }
+            //         cv_.notify_one(); 
+                    
+            //         // 🚨 真正的外壳销毁地点在这里！
+            //         mpp_frame_deinit(&orig_frame);
+            //     } 
+            //     else 
+            //     {
+            //         printf("警告：无法找到原始输入帧，可能导致内存泄漏！\n");
+            //     }
+            // }
+        } 
+        else 
+        {
+            //printf("正在等待编码完成\n");
             // 硬件还没准备好数据，休眠 1 毫秒防止 CPU 空转占满
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -214,4 +255,19 @@ void RkMppEncoder::Stop()
     
     mpi_ = nullptr;
     printf("Encoder Stopped and Resources Released.");
+}
+
+MppBuffer RkMppEncoder::GetFreeBuffer() 
+{
+    std::unique_lock<std::mutex> lock(mtx_);
+    // 阻塞等待直到有空闲的 Buffer，或者编码器停止
+    cv_.wait(lock, [this]() { return !free_buffers_.empty() || !is_running_; });
+    
+    if (!is_running_ || free_buffers_.empty()) {
+        return nullptr;
+    }
+    
+    MppBuffer buf = free_buffers_.front();
+    free_buffers_.pop();
+    return buf;
 }
