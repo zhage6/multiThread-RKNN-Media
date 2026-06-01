@@ -71,13 +71,15 @@ bool RkMppEncoder::Init(int width, int height, MppFrameFormat fmt, MppCodingType
     }
     mpp_buffer_group_get_internal(&buf_grp_, MPP_BUFFER_TYPE_DRM); //暂定内部分配
 
-    size_t frame_size = width * height * 1.5; // 以 YUV420SP (NV12) 为例
-    for (int i = 0; i < 4; i++) 
-    {
-        MppBuffer buffer = nullptr;
-        mpp_buffer_get(buf_grp_, &buffer, frame_size);
-        free_buffers_.push(buffer); // 放入空闲队列
-    }
+    //size_t frame_size = width * height * 1.5; // 以 YUV420SP (NV12) 为例
+    // for (int i = 0; i < 4; i++) 
+    // {
+    //     MppBuffer buffer = nullptr;
+    //     mpp_buffer_get(buf_grp_, &buffer, frame_size);
+    //     free_buffers_.push(buffer); // 放入空闲队列
+    // }
+    size_t frame_size = width_ * height_ * 1.5; // NV12 格式大小
+    mpp_buffer_group_limit_config(buf_grp_, frame_size, 4);
     printf("Encoder Init Success. Width: %d, Height: %d", width_, height_);
     return true;
 }
@@ -102,6 +104,7 @@ bool RkMppEncoder::Start()
 
 bool RkMppEncoder::PushBuffer(MppBuffer buffer) 
 {
+
     MppFrame frame = nullptr;
     mpp_frame_init(&frame);
     
@@ -115,11 +118,14 @@ bool RkMppEncoder::PushBuffer(MppBuffer buffer)
     // 绑定已经带有画框数据的物理内存
     mpp_frame_set_buffer(frame, buffer);
 
-    // 丢给硬件编码队列 (非阻塞)
-    mpi_->encode_put_frame(ctx_, frame);
+    MPP_RET ret = mpi_->encode_put_frame(ctx_, frame);
+    if (ret != MPP_OK) {
+        printf("送入编码器失败!\n");
+    }
 
     // 销毁 Frame 外壳
-    // mpp_frame_deinit(&frame);
+    mpp_frame_deinit(&frame);
+    mpp_buffer_put(buffer);
     return true;
 }
 
@@ -143,30 +149,30 @@ void RkMppEncoder::OutputThreadFunc()
             printf("\n>>> [输出线程] 收到硬件码流包! 长度: %zu 字节, flags: 0x%08x\n", size, flags);
             bool is_keyframe = (flags & MPP_PACKET_FLAG_INTRA) ? true : false;
             
-            if (on_packet_ready_) 
-            {
+           if (size > 0 && on_packet_ready_) 
+           {
                 on_packet_ready_((const uint8_t*)data, size, is_keyframe);
-            }
+           }
 
-            // 2. 内存回收闭环：找出产生这个包的原始输入帧
-            MppMeta meta = mpp_packet_get_meta(packet);
-            MppFrame orig_frame = nullptr;
+            // // 2. 内存回收闭环：找出产生这个包的原始输入帧
+            // MppMeta meta = mpp_packet_get_meta(packet);
+            // MppFrame orig_frame = nullptr;
             
-            if (MPP_OK == mpp_meta_get_frame(meta, KEY_INPUT_FRAME, &orig_frame)) 
-            {
-                mpp_assert(orig_frame);
-                MppBuffer used_buffer = mpp_frame_get_buffer(orig_frame);
-                printf("一帧码流准备好了，正在回收物理 Buffer...\n");
-                // 放回空闲池并唤醒阻塞的 PushFrame
-                {
-                    std::lock_guard<std::mutex> lock(mtx_);
-                    free_buffers_.push(used_buffer);
-                }
-                cv_.notify_one(); 
-                printf("一帧编码完成，已回收物理 Buffer,唤醒等待的线程\n");
-                mpp_frame_deinit(&orig_frame);
-            }
-            printf("警告：无法找到原始输入帧，可能导致内存泄漏！\n");
+            // if (MPP_OK == mpp_meta_get_frame(meta, KEY_INPUT_FRAME, &orig_frame)) 
+            // {
+            //     mpp_assert(orig_frame);
+            //     MppBuffer used_buffer = mpp_frame_get_buffer(orig_frame);
+            //     printf("一帧码流准备好了，正在回收物理 Buffer...\n");
+            //     // 放回空闲池并唤醒阻塞的 PushFrame
+            //     {
+            //         std::lock_guard<std::mutex> lock(mtx_);
+            //         free_buffers_.push(used_buffer);
+            //     }
+            //     cv_.notify_one(); 
+            //     printf("一帧编码完成，已回收物理 Buffer,唤醒等待的线程\n");
+            //     mpp_frame_deinit(&orig_frame);
+            // }
+            // printf("警告：无法找到原始输入帧，可能导致内存泄漏！\n");
             // 销毁包描述符
             mpp_packet_deinit(&packet);
             // if (flags & MPP_PACKET_FLAG_EXTRA_DATA) 
@@ -259,15 +265,32 @@ void RkMppEncoder::Stop()
 
 MppBuffer RkMppEncoder::GetFreeBuffer() 
 {
-    std::unique_lock<std::mutex> lock(mtx_);
-    // 阻塞等待直到有空闲的 Buffer，或者编码器停止
-    cv_.wait(lock, [this]() { return !free_buffers_.empty() || !is_running_; });
+    // std::unique_lock<std::mutex> lock(mtx_);
+    // // 阻塞等待直到有空闲的 Buffer，或者编码器停止
+    // cv_.wait(lock, [this]() { return !free_buffers_.empty() || !is_running_; });
     
-    if (!is_running_ || free_buffers_.empty()) {
-        return nullptr;
+    // if (!is_running_ || free_buffers_.empty()) {
+    //     return nullptr;
+    // }
+    
+    // MppBuffer buf = free_buffers_.front();
+    // free_buffers_.pop();
+    // return buf;
+    MppBuffer buffer = nullptr;
+    size_t frame_size = width_ * height_ * 1.5; 
+
+    while (is_running_) 
+    {
+        // 尝试从硬件池中获取内存（拿出来时引用计数自动 +1）
+        MPP_RET ret = mpp_buffer_get(buf_grp_, &buffer, frame_size);
+        
+        if (ret == MPP_OK && buffer != nullptr) {
+            return buffer; // 成功拿到空闲内存，返回给上层去填充图像数据
+        }
+        
+        // 如果 4 块内存都在被硬件使用，get 会失败。稍微等 2 毫秒再试。
+        // 这就代替了你原来的 cv_.wait()，而且绝对不会死锁！
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    
-    MppBuffer buf = free_buffers_.front();
-    free_buffers_.pop();
-    return buf;
+    return nullptr;
 }
