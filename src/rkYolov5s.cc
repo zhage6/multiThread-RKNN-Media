@@ -307,48 +307,6 @@ InferOutput rkYolov5s::infer(input_data data)
         return out;
     }
 
-    // cv::Mat img;
-    // cv::cvtColor(orig_img, img, cv::COLOR_BGR2RGB);
-    // img_width = img.cols;
-    // img_height = img.rows;
-
-    // BOX_RECT pads;
-    // memset(&pads, 0, sizeof(BOX_RECT));
-    // cv::Size target_size(width, height);
-    // cv::Mat resized_img(target_size.height, target_size.width, CV_8UC3);
-    // // 计算缩放比例/Calculate the scaling ratio
-    // float scale_w = (float)target_size.width / img.cols;
-    // float scale_h = (float)target_size.height / img.rows;
-
-    // // 图像缩放/Image scaling
-    // if (img_width != width || img_height != height)
-    // {
-    //     // rga
-    //     rga_buffer_t src;
-    //     rga_buffer_t dst;
-    //     memset(&src, 0, sizeof(src));
-    //     memset(&dst, 0, sizeof(dst));
-    //     ret = resize_rga(src, dst, img, resized_img, target_size);
-    //     if (ret != 0)
-    //     {
-    //         fprintf(stderr, "resize with rga error\n");
-    //     }
-    //     /*********
-    //     // opencv
-    //     float min_scale = std::min(scale_w, scale_h);
-    //     scale_w = min_scale;
-    //     scale_h = min_scale;
-    //     letterbox(img, resized_img, pads, min_scale, target_size);
-    //     *********/
-    //     inputs[0].buf = resized_img.data;
-    // }
-    // else
-    // {
-    //     inputs[0].buf = img.data;
-    // }
-
-    // rknn_inputs_set(ctx, io_num.n_input, inputs);
-
     rknn_output outputs[io_num.n_output];
     memset(outputs, 0, sizeof(outputs));
     for (int i = 0; i < io_num.n_output; i++)

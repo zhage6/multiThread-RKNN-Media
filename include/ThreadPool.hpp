@@ -164,7 +164,7 @@ namespace dpool
         std::unordered_map<ThreadID, Thread> threads_;
     };
 
-    constexpr size_t ThreadPool::WAIT_SECONDS;
+    //constexpr size_t ThreadPool::WAIT_SECONDS;
 
 } // namespace dpool
 
