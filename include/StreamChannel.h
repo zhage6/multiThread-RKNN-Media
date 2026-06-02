@@ -2,10 +2,12 @@
 #include <string>
 #include <atomic>
 #include <iostream>
+#include <memory>
 #include "MppDecoder.h" // 你现有的 MPP 解码器
 #include "MppEncoder.h"
 #include "rknnPool.hpp"
 #include "rkYolov5s.hpp"
+#include "StreamPublisher.h"
 
 
 struct DetectResult {
@@ -56,10 +58,13 @@ class VideoChannel
 
         //编码器特性
         RkMppEncoder* m_encoder; //编码器对象
-        FILE* m_out_fp;
+        std::unique_ptr<StreamPublisher> m_publisher;
         std::map<uint64_t, InferOutput> m_reorder_buffer; // 重排池
         uint64_t m_expected_frame_id;
         std::mutex m_reorder_mtx;
+
+        uint64_t m_encode_packet_counter;
+        int m_output_fps;
 
 
 

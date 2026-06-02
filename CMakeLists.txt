@@ -43,6 +43,12 @@ find_package(OpenCV REQUIRED)
 
 include_directories(${OpenCV_INCLUDE_DIRS})
 
+# ffmpeg / libavformat for RTSP publisher
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil)
+include_directories(${FFMPEG_INCLUDE_DIRS})
+link_directories(${FFMPEG_LIBRARY_DIRS})
+
 set(CMAKE_INSTALL_RPATH "lib")
 
 
@@ -66,6 +72,7 @@ target_link_libraries(rknn_yolov5_demo
   ${OpenCV_LIBS}
   ${RGA_LIB}
   ${MPP_LIB}
+  ${FFMPEG_LIBRARIES}
 )
 
 
