@@ -1,4 +1,31 @@
 #include "StreamChannel.h"
+#include <algorithm>
+
+namespace {
+
+void release_source_buffer(const InferOutput& out)
+{
+    if (out.src_buffer) {
+        mpp_buffer_put(out.src_buffer);
+    }
+}
+
+int clamp_to_range(int value, int low, int high)
+{
+    return std::max(low, std::min(value, high));
+}
+
+int align_down_even(int value)
+{
+    return value & ~1;
+}
+
+int align_up_even(int value)
+{
+    return (value + 1) & ~1;
+}
+
+} // namespace
 
 VideoChannel::VideoChannel(int channel_id, const std::string& stream_url, 
                     GlobalPool* pool,std::atomic<int>& active_cnt)
@@ -43,6 +70,10 @@ void VideoChannel::start()
             // 当这个通道的 MPP 解出一帧时，会触发这里
             input_data data;
             data.src_fd = src_fd; 
+            data.src_buffer = mpp_frame_get_buffer(frame);
+            if (data.src_buffer) {
+                mpp_buffer_inc_ref(data.src_buffer);
+            }
             data.width = w;
             data.height = h;
             data.hor_stride = h_stride;
@@ -71,7 +102,7 @@ void VideoChannel::OnInferOutput(const InferOutput& out)
     // 1. 延迟初始化编码器 (在这里我们才能确定图像真正的宽高)
     if (m_encoder == nullptr) 
     {
-        InitEncoder(out.image.cols, out.image.rows, MPP_FMT_YUV420SP); // 根据实际格式调整
+        InitEncoder(out.width, out.height, MPP_FMT_YUV420SP);
     }
 
     // 2. 放入重排缓冲区
@@ -146,23 +177,51 @@ void VideoChannel::InitEncoder(int width,int height,MppFrameFormat fmt)
 
 void VideoChannel::EncodeZeroCopy(const InferOutput& out) 
 {
-    // 【做法 A：完美零拷贝】
-    // 如果你的 NPU 后处理（画框）是直接通过 RGA 画在了原始解码的 MppBuffer 上
-    // 那么 out 结构体里应该携带那个 mpp_buffer，你只需直接 Push：
-    // m_encoder->PushBuffer(out.mpp_buffer);
-
-    // 【做法 B：半零拷贝 (Mat 转 Buffer)】
-    // 如果 out.image 是一个 cv::Mat (CPU内存)，你需要向 Encoder 借一块物理内存，拷进去再送给硬件
-    MppBuffer mpp_buf = m_encoder->GetFreeBuffer();
-    if (mpp_buf != nullptr) {
-        void* ptr = mpp_buffer_get_ptr(mpp_buf);
-        size_t size = mpp_buffer_get_size(mpp_buf);
-        
-        // 注意：这里需要确保 cv::Mat 的数据格式与编码器期望的格式 (如 YUV420SP) 一致！
-        // 如果 cv::Mat 是 BGR，你可能还需要调用 RGA 把 BGR 转换成 NV12 并直接写入 mpp_buf
-        memcpy(ptr, out.image.data, std::min(size, (size_t)(out.image.total() * out.image.elemSize())));
-        
-        m_encoder->PushBuffer(mpp_buf);
+    if (out.src_buffer == nullptr || out.src_fd < 0) {
+        return;
     }
-}
 
+    MppBuffer mpp_buf = m_encoder->GetFreeBuffer();
+    if (mpp_buf == nullptr) {
+        release_source_buffer(out);
+        return;
+    }
+
+    int dst_fd = mpp_buffer_get_fd(mpp_buf);
+    rga_buffer_t src_img = wrapbuffer_fd(out.src_fd, out.width, out.height,
+                                         RK_FORMAT_YCbCr_420_SP,
+                                         out.hor_stride, out.ver_stride);
+    rga_buffer_t dst_img = wrapbuffer_fd(dst_fd, out.width, out.height,
+                                         RK_FORMAT_YCbCr_420_SP,
+                                         out.width, out.height);
+
+    IM_STATUS status = imcopy(src_img, dst_img);
+    if (status != IM_STATUS_SUCCESS) {
+        printf("RGA 编码前拷贝失败: %s\n", imStrError(status));
+        mpp_buffer_put(mpp_buf);
+        release_source_buffer(out);
+        return;
+    }
+
+    for (int i = 0; i < out.results.count; ++i) {
+        const auto& res = out.results.results[i];
+        int left = align_down_even(clamp_to_range(res.box.left, 0, out.width - 2));
+        int top = align_down_even(clamp_to_range(res.box.top, 0, out.height - 2));
+        int right = align_up_even(clamp_to_range(res.box.right, left + 2, out.width));
+        int bottom = align_up_even(clamp_to_range(res.box.bottom, top + 2, out.height));
+        int rect_w = right - left;
+        int rect_h = bottom - top;
+        if (rect_w < 2 || rect_h < 2) {
+            continue;
+        }
+
+        im_rect rect = {left, top, rect_w, rect_h};
+        status = imrectangle(dst_img, rect, 0x0000ff00, 4);
+        if (status != IM_STATUS_SUCCESS) {
+            printf("RGA 画框失败: %s\n", imStrError(status));
+        }
+    }
+
+    m_encoder->PushBuffer(mpp_buf);
+    release_source_buffer(out);
+}

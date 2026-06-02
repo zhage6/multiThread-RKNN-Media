@@ -18,7 +18,6 @@ static void dump_tensor_attr(rknn_tensor_attr *attr)
     {
         shape_str += ", " + std::to_string(attr->dims[i]);
     }
-
     // printf("  index=%d, name=%s, n_dims=%d, dims=[%s], n_elems=%d, size=%d, w_stride = %d, size_with_stride=%d, fmt=%s, "
     //        "type=%s, qnt_type=%s, "
     //        "zp=%d, scale=%f\n",
@@ -94,6 +93,13 @@ static int saveFloat(const char *file_name, float *output, int element_size)
 rkYolov5s::rkYolov5s(const std::string &model_path)
 {
     this->model_path = model_path;
+    model_data = nullptr;
+    input_attrs = nullptr;
+    output_attrs = nullptr;
+    input_mems[0] = nullptr;
+    input_dma_fd = -1;
+    input_dma_buf = nullptr;
+    input_dma_size = 0;
     nms_threshold = NMS_THRESH;      // 默认的NMS阈值
     box_conf_threshold = BOX_THRESH; // 默认的置信度阈值
 }
@@ -167,11 +173,28 @@ int rkYolov5s::init(rknn_context *ctx_in, bool share_weight)
         dump_tensor_attr(&(input_attrs[i]));
     }
     input_attrs[0].type = RKNN_TENSOR_UINT8;
-    input_mems[0] = rknn_create_mem(ctx,input_attrs[0].size_with_stride);
+    input_dma_size = input_attrs[0].size_with_stride;
+    if (dma_buf_alloc(DMA_HEAP_DMA32_UNCACHED_PATH, input_dma_size, &input_dma_fd, &input_dma_buf) < 0) {
+        printf("RKNN input DMA32 buffer alloc fail!\n");
+        return -1;
+    }
+    input_mems[0] = rknn_create_mem_from_fd(ctx, input_dma_fd, input_dma_buf, input_dma_size, 0);
+    if (input_mems[0] == nullptr) {
+        printf("RKNN input rknn_create_mem_from_fd fail!\n");
+        dma_buf_free(input_dma_size, &input_dma_fd, input_dma_buf);
+        input_dma_buf = nullptr;
+        input_dma_size = 0;
+        return -1;
+    }
     
     ret = rknn_set_io_mem(ctx, input_mems[0], &input_attrs[0]);
     if (ret < 0) {
         printf("input_mems rknn_set_io_mem fail! ret=%d\n", ret);
+        rknn_destroy_mem(ctx, input_mems[0]);
+        input_mems[0] = nullptr;
+        dma_buf_free(input_dma_size, &input_dma_fd, input_dma_buf);
+        input_dma_buf = nullptr;
+        input_dma_size = 0;
         return -1;
     }
     // 设置输出参数/Set the output parameters
@@ -235,7 +258,7 @@ rknn_context *rkYolov5s::get_pctx()
  * @return int         0 表示成功，<0 表示失败
  */
 int process_rga_zero_copy(int src_fd, int src_w, int src_h, int src_w_stride, int src_h_stride,
-                          int dst_fd, int dst_w, int dst_h) 
+                          int dst_fd, int dst_w, int dst_h, int dst_w_stride, int dst_h_stride) 
 {
 // 1. 包装源内存 (MPP NV12)
     rga_buffer_t src_img = wrapbuffer_fd(src_fd, src_w, src_h, 
@@ -245,7 +268,7 @@ int process_rga_zero_copy(int src_fd, int src_w, int src_h, int src_w_stride, in
     // 2. 包装目标内存 (NPU RGB)
     rga_buffer_t dst_img = wrapbuffer_fd(dst_fd, dst_w, dst_h, 
                                          RK_FORMAT_RGB_888, 
-                                         dst_w, dst_h);
+                                         dst_w_stride, dst_h_stride);
 
     // 3. 一键拉伸 + 转码！
     // RGA 非常聪明，它会自动读取 src 和 dst 里面的宽高和格式，直接完成所有转换
@@ -270,24 +293,11 @@ InferOutput rkYolov5s::infer(input_data data)
 
     // 2. 【核心 0 拷贝动作】：呼叫 RGA！
     // 将 MPP 的 YUV(src_fd) 直接转码缩放进我的 RGB(dst_fd) 专属模具里
+    int dst_w_stride = input_attrs[0].w_stride > 0 ? input_attrs[0].w_stride : width;
     int rga_ret = process_rga_zero_copy(
         data.src_fd, data.width, data.height, data.hor_stride, data.ver_stride,
-        dst_fd, width, height // width 和 height 是 YOLO 模型的 640x640
+        dst_fd, width, height, dst_w_stride, height // width 和 height 是 YOLO 模型的 640x640
     );
-
-    // 2. OpenCV 提取原图并做色彩转换
-    cv::Mat bgr_original;
-    if (rga_ret == 0 && data.frame != nullptr) 
-    {
-        MppBuffer buffer = mpp_frame_get_buffer(data.frame);
-        void* mpp_va = mpp_buffer_get_ptr(buffer);
-
-        // 使用对齐跨距构造 YUV，再裁剪成真实尺寸，最后转为 BGR
-        cv::Mat yuv_aligned(data.ver_stride * 3 / 2, data.hor_stride, CV_8UC1, mpp_va);
-        cv::Mat yuv_cropped = yuv_aligned(cv::Rect(0, 0, data.width, data.height * 3 / 2));
-        cv::cvtColor(yuv_cropped, bgr_original, cv::COLOR_YUV2BGR_NV12);
-    }
-
 
     if (data.frame != nullptr) {
         mpp_frame_deinit(&data.frame); //归还frame
@@ -300,10 +310,20 @@ InferOutput rkYolov5s::infer(input_data data)
     InferOutput out;
     out.channel_id = data.channel_id; // 贴上通道标签
     out.frame_id = data.frame_id;     // 贴上序号标签
+    out.src_buffer = data.src_buffer;
+    out.src_fd = data.src_fd;
+    out.width = data.width;
+    out.height = data.height;
+    out.hor_stride = data.hor_stride;
+    out.ver_stride = data.ver_stride;
     if (rga_ret != 0) {
         printf("RGA 搬运失败，丢弃该帧\n");
         out.results = detect_result_group;
         out.frame_id = -1;     // 贴上序号标签
+        if (data.src_buffer) {
+            mpp_buffer_put(data.src_buffer);
+            out.src_buffer = nullptr;
+        }
         return out;
     }
 
@@ -354,21 +374,8 @@ InferOutput rkYolov5s::infer(input_data data)
     //     putText(orig_img, text, cv::Point(x1, y1 + 12), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 255));
     // }
 
-    // 5. 画框 (画在刚转出来的 bgr_original 上)
-    if (!bgr_original.empty()) {
-        for (int i = 0; i < detect_result_group.count; i++) {
-            auto& res = detect_result_group.results[i];
-            cv::rectangle(bgr_original, cv::Point(res.box.left, res.box.top), 
-                          cv::Point(res.box.right, res.box.bottom), cv::Scalar(0, 255, 0), 2);
-            std::string label = "Class " + std::string(res.name);
-            cv::putText(bgr_original, label, cv::Point(res.box.left, res.box.top - 5), 
-                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
-        }
-    }
-
     ret = rknn_outputs_release(ctx, io_num.n_output, outputs);
     out.results = detect_result_group;
-    out.image = bgr_original;
     return out;
 }
 
@@ -378,6 +385,11 @@ rkYolov5s::~rkYolov5s()
     if (input_mems[0] != nullptr) 
     {
         rknn_destroy_mem(ctx, input_mems[0]);
+    }
+    if (input_dma_fd >= 0) {
+        dma_buf_free(input_dma_size, &input_dma_fd, input_dma_buf);
+        input_dma_buf = nullptr;
+        input_dma_size = 0;
     }
     ret = rknn_destroy(ctx);
 
