@@ -1,4 +1,5 @@
 #include "MppEncoder.h"
+#include <cstring>
 #include <rockchip/mpp_debug.h>
 RkMppEncoder::RkMppEncoder() 
     : ctx_(nullptr), 
@@ -69,17 +70,13 @@ bool RkMppEncoder::Init(int width, int height, MppFrameFormat fmt, MppCodingType
         // 处理配置下发失败的情况
         return false;
     }
-    mpp_buffer_group_get_internal(&buf_grp_, MPP_BUFFER_TYPE_DRM); //暂定内部分配
-
-    //size_t frame_size = width * height * 1.5; // 以 YUV420SP (NV12) 为例
-    // for (int i = 0; i < 4; i++) 
-    // {
-    //     MppBuffer buffer = nullptr;
-    //     mpp_buffer_get(buf_grp_, &buffer, frame_size);
-    //     free_buffers_.push(buffer); // 放入空闲队列
-    // }
     size_t frame_size = width_ * height_ * 1.5; // NV12 格式大小
-    mpp_buffer_group_limit_config(buf_grp_, frame_size, 4);
+    if (!AllocateExternalBuffers(frame_size, 4)) {
+        ReleaseExternalBuffers();
+        
+        return false;
+    }
+
     printf("Encoder Init Success. Width: %d, Height: %d", width_, height_);
     return true;
 }
@@ -125,8 +122,13 @@ bool RkMppEncoder::PushBuffer(MppBuffer buffer)
 
     // 销毁 Frame 外壳
     mpp_frame_deinit(&frame);
-    mpp_buffer_put(buffer);
-    return true;
+
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        free_buffers_.push(buffer);
+    }
+    cv_.notify_one();
+    return ret == MPP_OK;
 }
 
 void RkMppEncoder::OutputThreadFunc() 
@@ -233,15 +235,14 @@ void RkMppEncoder::Stop()
         output_thread_.join();
     }
 
-    // 4. 清理空闲的物理 Buffer
+    // 4. 清理空闲队列引用，真实 buffer 由 external_buffers_ 统一释放
     {
         std::lock_guard<std::mutex> lock(mtx_);
         while (!free_buffers_.empty()) {
-            MppBuffer buf = free_buffers_.front();
-            mpp_buffer_put(buf); // 释放物理内存
             free_buffers_.pop();
         }
     }
+    ReleaseExternalBuffers();
 
     // 5. 销毁 MPP 各种句柄
     if (buf_grp_) {
@@ -265,32 +266,65 @@ void RkMppEncoder::Stop()
 
 MppBuffer RkMppEncoder::GetFreeBuffer() 
 {
-    // std::unique_lock<std::mutex> lock(mtx_);
-    // // 阻塞等待直到有空闲的 Buffer，或者编码器停止
-    // cv_.wait(lock, [this]() { return !free_buffers_.empty() || !is_running_; });
-    
-    // if (!is_running_ || free_buffers_.empty()) {
-    //     return nullptr;
-    // }
-    
-    // MppBuffer buf = free_buffers_.front();
-    // free_buffers_.pop();
-    // return buf;
-    MppBuffer buffer = nullptr;
-    size_t frame_size = width_ * height_ * 1.5; 
+    std::unique_lock<std::mutex> lock(mtx_);
+    cv_.wait(lock, [this]() { return !free_buffers_.empty() || !is_running_; });
 
-    while (is_running_) 
-    {
-        // 尝试从硬件池中获取内存（拿出来时引用计数自动 +1）
-        MPP_RET ret = mpp_buffer_get(buf_grp_, &buffer, frame_size);
-        
-        if (ret == MPP_OK && buffer != nullptr) {
-            return buffer; // 成功拿到空闲内存，返回给上层去填充图像数据
-        }
-        
-        // 如果 4 块内存都在被硬件使用，get 会失败。稍微等 2 毫秒再试。
-        // 这就代替了你原来的 cv_.wait()，而且绝对不会死锁！
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    if (!is_running_ || free_buffers_.empty()) {
+        return nullptr;
     }
-    return nullptr;
+
+    MppBuffer buffer = free_buffers_.front();
+    free_buffers_.pop();
+    return buffer;
+}
+
+bool RkMppEncoder::AllocateExternalBuffers(size_t frame_size, int count)
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    for (int i = 0; i < count; ++i) {
+        EncoderExternalBuffer ext_buf;
+        std::memset(&ext_buf, 0, sizeof(ext_buf));
+        ext_buf.fd = -1;
+        ext_buf.size = frame_size;
+
+        if (dma_buf_alloc(DMA_HEAP_DMA32_UNCACHED_PATH, frame_size, &ext_buf.fd, &ext_buf.ptr) < 0) {
+            printf("Encoder DMA32 buffer 申请失败!\n");
+            return false;
+        }
+
+        MppBufferInfo info;
+        std::memset(&info, 0, sizeof(info));
+        info.type = MPP_BUFFER_TYPE_DMA_HEAP;
+        info.size = frame_size;
+        info.fd = ext_buf.fd;
+        info.ptr = ext_buf.ptr;
+
+        if (mpp_buffer_import(&ext_buf.buffer, &info) != MPP_OK) {
+            printf("Encoder DMA32 buffer import 到 MPP 失败!\n");
+            dma_buf_free(ext_buf.size, &ext_buf.fd, ext_buf.ptr);
+            return false;
+        }
+
+        free_buffers_.push(ext_buf.buffer);
+        external_buffers_.push_back(ext_buf);
+    }
+
+    printf("Encoder 已分配 %d 块 DMA32 输入 buffer。\n", count);
+    return true;
+}
+
+void RkMppEncoder::ReleaseExternalBuffers()
+{
+    for (auto& ext_buf : external_buffers_) {
+        if (ext_buf.buffer) {
+            mpp_buffer_put(ext_buf.buffer);
+            ext_buf.buffer = nullptr;
+        }
+        if (ext_buf.fd >= 0) {
+            dma_buf_free(ext_buf.size, &ext_buf.fd, ext_buf.ptr);
+            ext_buf.ptr = nullptr;
+        }
+    }
+    external_buffers_.clear();
 }

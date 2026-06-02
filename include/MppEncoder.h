@@ -3,11 +3,13 @@
 #include <condition_variable>
 #include <queue>
 #include <functional>
+#include <vector>
 #include <rockchip/rk_mpi.h>
 #include <rockchip/mpp_frame.h>
 #include <rockchip/mpp_buffer.h>
 #include <rockchip/mpp_packet.h>
 #include "mpp_packet_impl.h"
+#include "dma_alloc.h"
 
 
 // 定义码流回调函数的类型
@@ -44,8 +46,17 @@ private:
     // 原 Demo 中的 enc_test_input 和 enc_test_output 逻辑移入这里
     void InputThreadFunc();
     void OutputThreadFunc();
+    bool AllocateExternalBuffers(size_t frame_size, int count);
+    void ReleaseExternalBuffers();
 
 private:
+    struct EncoderExternalBuffer {
+        MppBuffer buffer;
+        int fd;
+        void* ptr;
+        size_t size;
+    };
+
     // MPP 核心上下文 (原 MpiEncTestData 中的核心成员)
     MppCtx ctx_;
     MppApi* mpi_;
@@ -67,6 +78,7 @@ private:
 
     // Buffer 管理：替代原先的 priv->list_buf
     std::queue<MppBuffer> free_buffers_; 
+    std::vector<EncoderExternalBuffer> external_buffers_;
     std::mutex mtx_;
     std::condition_variable cv_;
 };
