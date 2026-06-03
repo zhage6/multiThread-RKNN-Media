@@ -37,7 +37,8 @@ VideoChannel::VideoChannel(int channel_id, const std::string& stream_url,
           m_active_count(active_cnt),
           m_expected_frame_id(0), // 初始化期待的帧号
           m_encoder(nullptr),
-          m_out_fp(nullptr)
+          m_encode_packet_counter(0),
+          m_output_fps(30)
 {
     // 实例化该通道专属的 MPP 解码器
     m_decoder = new MppDecoder();
@@ -55,10 +56,8 @@ VideoChannel::~VideoChannel()
         delete m_encoder; 
         m_encoder = nullptr; 
     }
-    if (m_out_fp)  
-    {   
-        fclose(m_out_fp); 
-        m_out_fp = nullptr; 
+    if (m_publisher) {
+        m_publisher->Close();
     }
 }
 
@@ -159,14 +158,31 @@ void VideoChannel::InitEncoder(int width,int height,MppFrameFormat fmt)
 {
     m_encoder = new RkMppEncoder();
     m_encoder->Init(width, height, fmt, MPP_VIDEO_CodingAVC);
-    std::string out_file = "result_channel_" + std::to_string(m_channel_id) + ".h264";
-    m_out_fp = fopen(out_file.c_str(), "wb");
+    std::vector<uint8_t> h264_header;
+    if (!m_encoder->GetHeader(h264_header)) 
+    {
+        printf("获取 H264 SPS/PPS 失败\n");
+    }
+   std::string rtsp_url =
+    "rtsp://127.0.0.1:8554/live/channel" + std::to_string(m_channel_id);
+    m_publisher.reset(new RtspPublisher());
+    if (!m_publisher->Init(rtsp_url, width, height, m_output_fps, h264_header.data(), h264_header.size())) 
+    {
+        printf("通道 %d RTSP 推流初始化失败: %s\n", m_channel_id, rtsp_url.c_str());
+    }
     m_encoder->SetOutputCallback([this](const uint8_t* data, size_t size, bool is_keyframe) 
     {
         printf("编码器编码完成一帧\n");
-        if (m_out_fp) 
-        {
-            fwrite(data, 1, size, m_out_fp);
+        EncodedPacket packet;
+        packet.channel_id = m_channel_id;
+        packet.data = data;
+        packet.size = size;
+        packet.keyframe = is_keyframe;
+        packet.pts = m_encode_packet_counter * 90000 / m_output_fps;//90kHz 时钟
+        packet.dts = packet.pts;//时间戳
+        m_encode_packet_counter++;
+        if (m_publisher) {
+            m_publisher->Push(packet);
         }
     });
 

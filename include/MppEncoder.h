@@ -39,6 +39,8 @@ public:
     
     bool PushBuffer(MppBuffer buffer);
 
+    bool GetHeader(std::vector<uint8_t>& header);
+
     // 5. 停止并释放资源
     void Stop();
 
