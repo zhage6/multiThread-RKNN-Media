@@ -1,6 +1,7 @@
 #include "MppEncoder.h"
 #include <cstring>
 #include <rockchip/mpp_debug.h>
+#include <rockchip/rk_venc_cmd.h>
 RkMppEncoder::RkMppEncoder() 
     : ctx_(nullptr), 
       mpi_(nullptr), 
@@ -70,6 +71,10 @@ bool RkMppEncoder::Init(int width, int height, MppFrameFormat fmt, MppCodingType
         // 处理配置下发失败的情况
         return false;
     }
+
+    MppEncHeaderMode header_mode = MPP_ENC_HEADER_MODE_EACH_IDR;
+    mpi_->control(ctx_, MPP_ENC_SET_HEADER_MODE, &header_mode);
+
     size_t frame_size = width_ * height_ * 1.5; // NV12 格式大小
     if (!AllocateExternalBuffers(frame_size, 4)) {
         ReleaseExternalBuffers();
@@ -327,4 +332,39 @@ void RkMppEncoder::ReleaseExternalBuffers()
         }
     }
     external_buffers_.clear();
+}
+
+bool RkMppEncoder::GetHeader(std::vector<uint8_t>& header)
+{
+    header.clear();
+
+    size_t size = 4096;
+    header.resize(size);
+
+    MppPacket packet = nullptr;
+    MPP_RET ret = mpp_packet_init(&packet, header.data(), size);
+    if (ret != MPP_OK || packet == nullptr) {
+        header.clear();
+        return false;
+    }
+
+    mpp_packet_set_length(packet, 0);
+
+    ret = mpi_->control(ctx_, MPP_ENC_GET_HDR_SYNC, packet);
+    if (ret != MPP_OK) {
+        mpp_packet_deinit(&packet);
+        header.clear();
+        return false;
+    }
+
+    size_t len = mpp_packet_get_length(packet);
+    mpp_packet_deinit(&packet);
+
+    if (len == 0 || len > size) {
+        header.clear();
+        return false;
+    }
+
+    header.resize(len);
+    return true;
 }

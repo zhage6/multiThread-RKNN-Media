@@ -158,10 +158,15 @@ void VideoChannel::InitEncoder(int width,int height,MppFrameFormat fmt)
 {
     m_encoder = new RkMppEncoder();
     m_encoder->Init(width, height, fmt, MPP_VIDEO_CodingAVC);
+    std::vector<uint8_t> h264_header;
+    if (!m_encoder->GetHeader(h264_header)) 
+    {
+        printf("获取 H264 SPS/PPS 失败\n");
+    }
    std::string rtsp_url =
     "rtsp://127.0.0.1:8554/live/channel" + std::to_string(m_channel_id);
     m_publisher.reset(new RtspPublisher());
-    if (!m_publisher->Init(rtsp_url, width, height, m_output_fps)) 
+    if (!m_publisher->Init(rtsp_url, width, height, m_output_fps, h264_header.data(), h264_header.size())) 
     {
         printf("通道 %d RTSP 推流初始化失败: %s\n", m_channel_id, rtsp_url.c_str());
     }

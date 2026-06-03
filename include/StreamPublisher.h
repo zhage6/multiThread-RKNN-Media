@@ -26,7 +26,7 @@ class StreamPublisher
 {
 public:
     virtual ~StreamPublisher() = default;
-    virtual bool Init(const std::string& url, int width, int height, int fps) = 0;
+    virtual bool Init(const std::string& url, int width, int height, int fps, const uint8_t* extra_data, size_t extra_size) = 0;
     virtual bool Push(const EncodedPacket& packet) = 0;
     virtual void Close() = 0;
 };//多态接口，方便未来扩展网络推流等功能
@@ -37,11 +37,13 @@ public:
     FilePublisher() = default;
     ~FilePublisher() override { Close(); }
 
-    bool Init(const std::string& url, int width, int height, int fps) override
+    bool Init(const std::string& url, int width, int height, int fps,const uint8_t* extra_data, size_t extra_size) override
     {
         (void)width;
         (void)height;//(void)是为了避免未使用参数的编译警告，因为这个简单的文件发布器不需要这些参数，但未来如果扩展网络推流可能会用到它们，所以保留接口一致性)
         (void)fps;
+        (void)extra_data;
+        (void)extra_size;
         fp_ = std::fopen(url.c_str(), "wb");
         return fp_ != nullptr;
     }
@@ -73,7 +75,7 @@ public:
     RtspPublisher() = default;
     ~RtspPublisher() override { Close(); }
 
-    bool Init(const std::string& url, int width, int height, int fps) override
+    bool Init(const std::string& url, int width, int height, int fps,const uint8_t* extra_data, size_t extra_size) override
     {
         url_ = url;
         width_ = width;
@@ -118,6 +120,12 @@ public:
             }
         }
         printf("RTSP init 3 open io\n");
+        if (extra_data && extra_size > 0) 
+        {
+            codecpar->extradata = (uint8_t*)av_mallocz(extra_size + AV_INPUT_BUFFER_PADDING_SIZE);
+            std::memcpy(codecpar->extradata, extra_data, extra_size);
+            codecpar->extradata_size = extra_size;
+        }
         ret = avformat_write_header(fmt_ctx_, &options);
         printf("RTSP init 4 write header\n");
         av_dict_free(&options);
