@@ -117,7 +117,8 @@ int MppDecoder::AllocateExternalBuffers(size_t buf_size, int width, int height) 
         commit_info.ptr  = ext_buf.src_buf; // 虚拟地址供参考
 
         ret = mpp_buffer_commit(m_frm_grp, &commit_info);
-        if (ret != MPP_OK) {
+        if (ret != MPP_OK) 
+        {
             std::cerr << "向 MPP 提交外部内存失败!" << std::endl;
             return -1;
         }

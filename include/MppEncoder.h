@@ -4,6 +4,7 @@
 #include <queue>
 #include <functional>
 #include <vector>
+#include <atomic>
 #include <rockchip/rk_mpi.h>
 #include <rockchip/mpp_frame.h>
 #include <rockchip/mpp_buffer.h>
@@ -39,6 +40,8 @@ public:
     
     bool PushBuffer(MppBuffer buffer);
 
+    void RecycleBuffer(MppBuffer buffer);
+
     bool GetHeader(std::vector<uint8_t>& header);
 
     // 5. 停止并释放资源
@@ -73,7 +76,7 @@ private:
     // C++ 线程管理
     std::thread input_thread_;
     std::thread output_thread_;
-    bool is_running_;
+    std::atomic<bool> is_running_;
 
     // 回调函数
     PacketCallback on_packet_ready_;

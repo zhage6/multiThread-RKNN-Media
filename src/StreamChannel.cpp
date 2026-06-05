@@ -1,5 +1,6 @@
 #include "StreamChannel.h"
 #include <algorithm>
+#include <chrono>
 
 namespace {
 
@@ -38,6 +39,7 @@ VideoChannel::VideoChannel(int channel_id, const std::string& stream_url,
           m_expected_frame_id(0), // 初始化期待的帧号
           m_encoder(nullptr),
           m_encode_packet_counter(0),
+          m_last_packet_pts(-1),
           m_output_fps(30)
 {
     // 实例化该通道专属的 MPP 解码器
@@ -158,6 +160,7 @@ void VideoChannel::InitEncoder(int width,int height,MppFrameFormat fmt)
 {
     m_encoder = new RkMppEncoder();
     m_encoder->Init(width, height, fmt, MPP_VIDEO_CodingAVC);
+    m_stream_start_time = std::chrono::steady_clock::now();
     std::vector<uint8_t> h264_header;
     if (!m_encoder->GetHeader(h264_header)) 
     {
@@ -178,7 +181,13 @@ void VideoChannel::InitEncoder(int width,int height,MppFrameFormat fmt)
         packet.data = data;
         packet.size = size;
         packet.keyframe = is_keyframe;
-        packet.pts = m_encode_packet_counter * 90000 / m_output_fps;//90kHz 时钟
+        auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - m_stream_start_time).count();
+        packet.pts = elapsed_us * 90 / 1000;//90kHz 时钟，跟随真实推流节奏
+        if (packet.pts <= m_last_packet_pts) {
+            packet.pts = m_last_packet_pts + 1;
+        }
+        m_last_packet_pts = packet.pts;
         packet.dts = packet.pts;//时间戳
         m_encode_packet_counter++;
         if (m_publisher) {
@@ -194,6 +203,7 @@ void VideoChannel::InitEncoder(int width,int height,MppFrameFormat fmt)
 void VideoChannel::EncodeZeroCopy(const InferOutput& out) 
 {
     if (out.src_buffer == nullptr || out.src_fd < 0) {
+        release_source_buffer(out);
         return;
     }
 
@@ -214,7 +224,7 @@ void VideoChannel::EncodeZeroCopy(const InferOutput& out)
     IM_STATUS status = imcopy(src_img, dst_img);
     if (status != IM_STATUS_SUCCESS) {
         printf("RGA 编码前拷贝失败: %s\n", imStrError(status));
-        mpp_buffer_put(mpp_buf);
+        m_encoder->RecycleBuffer(mpp_buf);
         release_source_buffer(out);
         return;
     }

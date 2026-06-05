@@ -3,6 +3,7 @@
 #include <atomic>
 #include <iostream>
 #include <memory>
+#include <chrono>
 #include "MppDecoder.h" // 你现有的 MPP 解码器
 #include "MppEncoder.h"
 #include "rknnPool.hpp"
@@ -64,7 +65,9 @@ class VideoChannel
         std::mutex m_reorder_mtx;
 
         uint64_t m_encode_packet_counter;
+        int64_t m_last_packet_pts;
         int m_output_fps;
+        std::chrono::steady_clock::time_point m_stream_start_time;
 
 
 

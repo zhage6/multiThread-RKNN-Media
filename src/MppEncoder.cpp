@@ -1,6 +1,7 @@
 #include "MppEncoder.h"
 #include <cstring>
 #include <rockchip/mpp_debug.h>
+#include <rockchip/mpp_meta.h>
 #include <rockchip/rk_venc_cmd.h>
 RkMppEncoder::RkMppEncoder() 
     : ctx_(nullptr), 
@@ -106,9 +107,15 @@ bool RkMppEncoder::Start()
 
 bool RkMppEncoder::PushBuffer(MppBuffer buffer) 
 {
+    if (buffer == nullptr) {
+        return false;
+    }
 
     MppFrame frame = nullptr;
-    mpp_frame_init(&frame);
+    if (mpp_frame_init(&frame) != MPP_OK || frame == nullptr) {
+        RecycleBuffer(buffer);
+        return false;
+    }
     
     // 设置常规参数
     mpp_frame_set_width(frame, width_);
@@ -123,17 +130,13 @@ bool RkMppEncoder::PushBuffer(MppBuffer buffer)
     MPP_RET ret = mpi_->encode_put_frame(ctx_, frame);
     if (ret != MPP_OK) {
         printf("送入编码器失败!\n");
+        mpp_frame_deinit(&frame);
+        RecycleBuffer(buffer);
+        return false;
     }
 
-    // 销毁 Frame 外壳
-    mpp_frame_deinit(&frame);
-
-    {
-        std::lock_guard<std::mutex> lock(mtx_);
-        free_buffers_.push(buffer);
-    }
-    cv_.notify_one();
-    return ret == MPP_OK;
+    // frame 由编码器 packet meta 返还，等输出线程拿到对应 packet 后再释放并回收 buffer。
+    return true;
 }
 
 void RkMppEncoder::OutputThreadFunc() 
@@ -161,25 +164,14 @@ void RkMppEncoder::OutputThreadFunc()
                 on_packet_ready_((const uint8_t*)data, size, is_keyframe);
            }
 
-            // // 2. 内存回收闭环：找出产生这个包的原始输入帧
-            // MppMeta meta = mpp_packet_get_meta(packet);
-            // MppFrame orig_frame = nullptr;
-            
-            // if (MPP_OK == mpp_meta_get_frame(meta, KEY_INPUT_FRAME, &orig_frame)) 
-            // {
-            //     mpp_assert(orig_frame);
-            //     MppBuffer used_buffer = mpp_frame_get_buffer(orig_frame);
-            //     printf("一帧码流准备好了，正在回收物理 Buffer...\n");
-            //     // 放回空闲池并唤醒阻塞的 PushFrame
-            //     {
-            //         std::lock_guard<std::mutex> lock(mtx_);
-            //         free_buffers_.push(used_buffer);
-            //     }
-            //     cv_.notify_one(); 
-            //     printf("一帧编码完成，已回收物理 Buffer,唤醒等待的线程\n");
-            //     mpp_frame_deinit(&orig_frame);
-            // }
-            // printf("警告：无法找到原始输入帧，可能导致内存泄漏！\n");
+            MppMeta meta = mpp_packet_get_meta(packet);
+            MppFrame orig_frame = nullptr;
+            if (meta && MPP_OK == mpp_meta_get_frame(meta, KEY_INPUT_FRAME, &orig_frame) && orig_frame) {
+                MppBuffer used_buffer = mpp_frame_get_buffer(orig_frame);
+                RecycleBuffer(used_buffer);
+                mpp_frame_deinit(&orig_frame);
+            }
+
             // 销毁包描述符
             mpp_packet_deinit(&packet);
             // if (flags & MPP_PACKET_FLAG_EXTRA_DATA) 
@@ -220,6 +212,19 @@ void RkMppEncoder::OutputThreadFunc()
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
+}
+
+void RkMppEncoder::RecycleBuffer(MppBuffer buffer)
+{
+    if (buffer == nullptr) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        free_buffers_.push(buffer);
+    }
+    cv_.notify_one();
 }
 
 void RkMppEncoder::Stop() 
