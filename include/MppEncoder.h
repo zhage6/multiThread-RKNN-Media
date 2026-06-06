@@ -1,8 +1,7 @@
 #include <thread>
 #include <mutex>
-#include <condition_variable>
-#include <queue>
 #include <functional>
+#include <queue>
 #include <vector>
 #include <rockchip/rk_mpi.h>
 #include <rockchip/mpp_frame.h>
@@ -53,7 +52,6 @@ private:
 
 private:
     struct EncoderExternalBuffer {
-        MppBuffer buffer;
         int fd;
         void* ptr;
         size_t size;
@@ -68,6 +66,7 @@ private:
     // 基础参数
     int width_;
     int height_;
+    size_t frame_size_;
     MppFrameFormat fmt_;
     
     // C++ 线程管理
@@ -78,9 +77,8 @@ private:
     // 回调函数
     PacketCallback on_packet_ready_;
 
-    // Buffer 管理：替代原先的 priv->list_buf
-    std::queue<MppBuffer> free_buffers_; 
+    // 外部 DMA32 buffer 由 MppBufferGroup 负责池化，fd 生命周期仍由本类释放。
     std::vector<EncoderExternalBuffer> external_buffers_;
+    std::queue<MppBuffer> inflight_buffers_;
     std::mutex mtx_;
-    std::condition_variable cv_;
 };
