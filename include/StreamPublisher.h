@@ -11,6 +11,12 @@ extern "C" {
 #include <cstdio>
 #include <string>
 #include <cstring>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 struct EncodedPacket 
 {
@@ -108,6 +114,8 @@ public:
 
         AVDictionary* options = nullptr;
         av_dict_set(&options, "rtsp_transport", "tcp", 0);
+        av_dict_set(&options, "stimeout", "2000000", 0);
+        av_dict_set(&options, "rw_timeout", "2000000", 0);
 
         if (!(fmt_ctx_->oformat->flags & AVFMT_NOFILE)) 
         {
@@ -137,6 +145,8 @@ public:
         }
 
         started_ = true;
+        worker_running_ = true;
+        worker_thread_ = std::thread(&RtspPublisher::WorkerLoop, this);
         printf("RTSP publisher started: %s\n", url_.c_str());
         return true;
     }
@@ -147,19 +157,112 @@ public:
             packet.data == nullptr || packet.size == 0) {
             return false;
         }
+
+        QueuedPacket queued;
+        queued.channel_id = packet.channel_id;
+        queued.data.assign(packet.data, packet.data + packet.size);
+        queued.keyframe = packet.keyframe;
+        queued.pts = packet.pts;
+        queued.dts = packet.dts;
+
+        {
+            std::lock_guard<std::mutex> lock(queue_mtx_);
+            while (packet_queue_.size() >= max_queue_packets_) {
+                packet_queue_.pop_front();
+            }
+            packet_queue_.push_back(std::move(queued));
+        }
+        queue_cv_.notify_one();
+        return true;
+    }
+
+    void Close() override
+    {
+        worker_running_ = false;
+        queue_cv_.notify_all();
+        if (worker_thread_.joinable()) {
+            worker_thread_.join();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(queue_mtx_);
+            packet_queue_.clear();
+        }
+
+        if (fmt_ctx_) {
+            if (started_) {
+                av_write_trailer(fmt_ctx_);
+            }
+
+            if (!(fmt_ctx_->oformat->flags & AVFMT_NOFILE) && fmt_ctx_->pb) {
+                avio_closep(&fmt_ctx_->pb);
+            }
+
+            avformat_free_context(fmt_ctx_);
+            fmt_ctx_ = nullptr;
+        }
+
+        stream_ = nullptr;
+        started_ = false;
+    }
+
+private:
+    struct QueuedPacket 
+    {
+        int channel_id = -1;
+        std::vector<uint8_t> data;
+        bool keyframe = false;
+        int64_t pts = 0;
+        int64_t dts = 0;
+    };
+
+    void WorkerLoop()
+    {
+        while (true) {
+            QueuedPacket packet;
+
+            {
+                std::unique_lock<std::mutex> lock(queue_mtx_);
+                queue_cv_.wait(lock, [this]() {
+                    return !worker_running_ || !packet_queue_.empty();
+                });
+
+                if (!worker_running_) {
+                    packet_queue_.clear();
+                    break;
+                }
+
+                if (packet_queue_.empty()) {
+                    continue;
+                }
+
+                packet = std::move(packet_queue_.front());
+                packet_queue_.pop_front();
+            }
+
+            WritePacket(packet);
+        }
+    }
+
+    bool WritePacket(const QueuedPacket& packet)
+    {
+        if (!started_ || fmt_ctx_ == nullptr || stream_ == nullptr || packet.data.empty()) {
+            return false;
+        }
+
         AVPacket* avpkt = av_packet_alloc();
         if (avpkt == nullptr) {
             return false;
         }
 
-        int ret = av_new_packet(avpkt, static_cast<int>(packet.size));
+        int ret = av_new_packet(avpkt, static_cast<int>(packet.data.size()));
         if (ret < 0) {
             av_packet_free(&avpkt);
             printf("av_new_packet failed: %d\n", ret);
             return false;
         }
 
-        std::memcpy(avpkt->data, packet.data, packet.size);
+        std::memcpy(avpkt->data, packet.data.data(), packet.data.size());
 
         avpkt->stream_index = stream_->index;
         avpkt->pts = packet.pts;
@@ -181,35 +284,20 @@ public:
         }
 
 
-        // 下一步再真正填 AVPacket 推出去
         return true;
     }
 
-    void Close() override
-    {
-        if (fmt_ctx_) {
-            if (started_) {
-                av_write_trailer(fmt_ctx_);
-            }
-
-            if (!(fmt_ctx_->oformat->flags & AVFMT_NOFILE) && fmt_ctx_->pb) {
-                avio_closep(&fmt_ctx_->pb);
-            }
-
-            avformat_free_context(fmt_ctx_);
-            fmt_ctx_ = nullptr;
-        }
-
-        stream_ = nullptr;
-        started_ = false;
-    }
-
-private:
     std::string url_;
     int width_ = 0;
     int height_ = 0;
     int fps_ = 30;
     bool started_ = false;
+    std::atomic<bool> worker_running_{false};
+    std::thread worker_thread_;
+    std::mutex queue_mtx_;
+    std::condition_variable queue_cv_;
+    std::deque<QueuedPacket> packet_queue_;
+    size_t max_queue_packets_ = 60;
 
     AVFormatContext* fmt_ctx_ = nullptr;
     AVStream* stream_ = nullptr;

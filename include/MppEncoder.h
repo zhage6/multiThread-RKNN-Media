@@ -1,6 +1,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <deque>
 #include <queue>
 #include <functional>
 #include <vector>
@@ -53,6 +54,9 @@ private:
     void OutputThreadFunc();
     bool AllocateExternalBuffers(size_t frame_size, int count);
     void ReleaseExternalBuffers();
+    void RecycleEncodedFrame(MppFrame frame);
+    void RemovePendingFrame(MppFrame frame);
+    bool RecycleOldestPendingFrame();
 
 private:
     struct EncoderExternalBuffer {
@@ -83,6 +87,7 @@ private:
 
     // Buffer 管理：替代原先的 priv->list_buf
     std::queue<MppBuffer> free_buffers_; 
+    std::deque<MppFrame> pending_frames_;
     std::vector<EncoderExternalBuffer> external_buffers_;
     std::mutex mtx_;
     std::condition_variable cv_;

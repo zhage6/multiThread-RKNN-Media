@@ -1,4 +1,6 @@
 #include "MppEncoder.h"
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <rockchip/mpp_debug.h>
 #include <rockchip/mpp_meta.h>
@@ -127,15 +129,21 @@ bool RkMppEncoder::PushBuffer(MppBuffer buffer)
     // 绑定已经带有画框数据的物理内存
     mpp_frame_set_buffer(frame, buffer);
 
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        pending_frames_.push_back(frame);
+    }
+
     MPP_RET ret = mpi_->encode_put_frame(ctx_, frame);
     if (ret != MPP_OK) {
         printf("送入编码器失败!\n");
+        RemovePendingFrame(frame);
         mpp_frame_deinit(&frame);
         RecycleBuffer(buffer);
         return false;
     }
 
-    // frame 由编码器 packet meta 返还，等输出线程拿到对应 packet 后再释放并回收 buffer。
+    // frame 等输出线程收到对应 packet 后再释放并回收 buffer。
     return true;
 }
 
@@ -166,10 +174,18 @@ void RkMppEncoder::OutputThreadFunc()
 
             MppMeta meta = mpp_packet_get_meta(packet);
             MppFrame orig_frame = nullptr;
+            bool frame_recycled = false;
             if (meta && MPP_OK == mpp_meta_get_frame(meta, KEY_INPUT_FRAME, &orig_frame) && orig_frame) {
-                MppBuffer used_buffer = mpp_frame_get_buffer(orig_frame);
-                RecycleBuffer(used_buffer);
-                mpp_frame_deinit(&orig_frame);
+                RemovePendingFrame(orig_frame);
+                RecycleEncodedFrame(orig_frame);
+                frame_recycled = true;
+            }
+
+            if (!frame_recycled) {
+                frame_recycled = RecycleOldestPendingFrame();
+                if (!frame_recycled) {
+                    printf("警告：编码输出 packet 没有找到可回收的输入帧。\n");
+                }
             }
 
             // 销毁包描述符
@@ -227,6 +243,56 @@ void RkMppEncoder::RecycleBuffer(MppBuffer buffer)
     cv_.notify_one();
 }
 
+void RkMppEncoder::RecycleEncodedFrame(MppFrame frame)
+{
+    if (frame == nullptr) {
+        return;
+    }
+
+    MppBuffer used_buffer = mpp_frame_get_buffer(frame);
+    RecycleBuffer(used_buffer);
+    mpp_frame_deinit(&frame);
+}
+
+void RkMppEncoder::RemovePendingFrame(MppFrame frame)
+{
+    MppBuffer target_buffer = frame ? mpp_frame_get_buffer(frame) : nullptr;
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    for (auto it = pending_frames_.begin(); it != pending_frames_.end(); ++it) {
+        MppFrame pending_frame = *it;
+        if (pending_frame == frame) {
+            pending_frames_.erase(it);
+            return;
+        }
+
+        if (target_buffer && pending_frame &&
+            mpp_frame_get_buffer(pending_frame) == target_buffer) {
+            pending_frames_.erase(it);
+            mpp_frame_deinit(&pending_frame);
+            return;
+        }
+    }
+}
+
+bool RkMppEncoder::RecycleOldestPendingFrame()
+{
+    MppFrame frame = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (pending_frames_.empty()) {
+            return false;
+        }
+
+        frame = pending_frames_.front();
+        pending_frames_.pop_front();
+    }
+
+    RecycleEncodedFrame(frame);
+    return true;
+}
+
 void RkMppEncoder::Stop() 
 {
     if (!is_running_) return;
@@ -248,6 +314,13 @@ void RkMppEncoder::Stop()
     // 4. 清理空闲队列引用，真实 buffer 由 external_buffers_ 统一释放
     {
         std::lock_guard<std::mutex> lock(mtx_);
+        for (auto frame : pending_frames_) {
+            if (frame) {
+                mpp_frame_deinit(&frame);
+            }
+        }
+        pending_frames_.clear();
+
         while (!free_buffers_.empty()) {
             free_buffers_.pop();
         }
@@ -277,7 +350,12 @@ void RkMppEncoder::Stop()
 MppBuffer RkMppEncoder::GetFreeBuffer() 
 {
     std::unique_lock<std::mutex> lock(mtx_);
-    cv_.wait(lock, [this]() { return !free_buffers_.empty() || !is_running_; });
+    while (free_buffers_.empty() && is_running_) {
+        if (cv_.wait_for(lock, std::chrono::seconds(2)) == std::cv_status::timeout) {
+            printf("警告：编码器正在等待空闲输入 buffer，pending_frames=%zu。\n",
+                   pending_frames_.size());
+        }
+    }
 
     if (!is_running_ || free_buffers_.empty()) {
         return nullptr;
