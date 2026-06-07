@@ -40,7 +40,7 @@ VideoChannel::VideoChannel(int channel_id, const std::string& stream_url,
           m_encoder(nullptr),
           m_encode_packet_counter(0),
           m_last_packet_pts(-1),
-          m_output_fps(30)
+          m_output_fps(24)
 {
     // 实例化该通道专属的 MPP 解码器
     m_decoder = new MppDecoder();
@@ -176,20 +176,24 @@ void VideoChannel::InitEncoder(int width,int height,MppFrameFormat fmt)
     m_encoder->SetOutputCallback([this](const uint8_t* data, size_t size, bool is_keyframe) 
     {
         printf("编码器编码完成一帧\n");
+        const int fps = std::max(1, m_output_fps);
+        const uint64_t frame_index = m_encode_packet_counter++;
+
+        auto target_time = m_stream_start_time +
+            std::chrono::microseconds(frame_index * 1000000 / fps);
+        std::this_thread::sleep_until(target_time);
+
         EncodedPacket packet;
         packet.channel_id = m_channel_id;
         packet.data = data;
         packet.size = size;
         packet.keyframe = is_keyframe;
-        auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - m_stream_start_time).count();
-        packet.pts = elapsed_us * 90 / 1000;//90kHz 时钟，跟随真实推流节奏
+        packet.pts = static_cast<int64_t>(frame_index * 90000 / fps);
         if (packet.pts <= m_last_packet_pts) {
             packet.pts = m_last_packet_pts + 1;
         }
         m_last_packet_pts = packet.pts;
         packet.dts = packet.pts;//时间戳
-        m_encode_packet_counter++;
         if (m_publisher) {
             m_publisher->Push(packet);
         }

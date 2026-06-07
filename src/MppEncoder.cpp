@@ -45,7 +45,7 @@ bool RkMppEncoder::Init(int width, int height, MppFrameFormat fmt, MppCodingType
     // --- 码率控制配置 (RC: Rate Control) ---
     int fps_in = 30;
     int fps_out = 30;
-    int bps = width * height * fps_out / 14; // 这是一个粗略的码率估算公式，可自定义
+    int bps = width * height * fps_out * 0.1 *1; // 这是一个粗略的码率估算公式，可自定义
     
     // 设置 CBR (固定码率) 或 VBR (动态码率)
     mpp_enc_cfg_set_s32(cfg_, "rc:mode", MPP_ENC_RC_MODE_CBR); 
@@ -79,7 +79,7 @@ bool RkMppEncoder::Init(int width, int height, MppFrameFormat fmt, MppCodingType
     mpi_->control(ctx_, MPP_ENC_SET_HEADER_MODE, &header_mode);
 
     size_t frame_size = width_ * height_ * 1.5; // NV12 格式大小
-    if (!AllocateExternalBuffers(frame_size, 4)) {
+    if (!AllocateExternalBuffers(frame_size, 12)) {
         ReleaseExternalBuffers();
         
         return false;

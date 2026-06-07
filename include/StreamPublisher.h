@@ -11,12 +11,6 @@ extern "C" {
 #include <cstdio>
 #include <string>
 #include <cstring>
-#include <atomic>
-#include <condition_variable>
-#include <deque>
-#include <mutex>
-#include <thread>
-#include <vector>
 
 struct EncodedPacket 
 {
@@ -88,9 +82,11 @@ public:
         height_ = height;
         fps_ = fps;
 
+        avformat_network_init();
+
         int ret = avformat_alloc_output_context2(&fmt_ctx_, nullptr, "rtsp", url.c_str());
         if (ret < 0 || fmt_ctx_ == nullptr) {
-            printf("avformat_alloc_output_context2 failed: %d\n", ret);
+            PrintAvError("avformat_alloc_output_context2 failed", ret);
             return false;
         }
         printf("RTSP init 1 alloc ctx\n");
@@ -111,6 +107,7 @@ public:
         codecpar->width = width_;
         codecpar->height = height_;
         codecpar->format = AV_PIX_FMT_YUV420P;
+        codecpar->codec_tag = 0;
 
         AVDictionary* options = nullptr;
         av_dict_set(&options, "rtsp_transport", "tcp", 0);
@@ -121,7 +118,7 @@ public:
         {
             ret = avio_open2(&fmt_ctx_->pb, url.c_str(), AVIO_FLAG_WRITE, nullptr, &options);
             if (ret < 0) {
-                printf("avio_open2 failed: %d\n", ret);
+                PrintAvError("avio_open2 failed", ret);
                 av_dict_free(&options);
                 Close();
                 return false;
@@ -139,14 +136,12 @@ public:
         av_dict_free(&options);
 
         if (ret < 0) {
-            printf("avformat_write_header failed: %d\n", ret);
+            PrintAvError("avformat_write_header failed", ret);
             Close();
             return false;
         }
 
         started_ = true;
-        worker_running_ = true;
-        worker_thread_ = std::thread(&RtspPublisher::WorkerLoop, this);
         printf("RTSP publisher started: %s\n", url_.c_str());
         return true;
     }
@@ -158,37 +153,45 @@ public:
             return false;
         }
 
-        QueuedPacket queued;
-        queued.channel_id = packet.channel_id;
-        queued.data.assign(packet.data, packet.data + packet.size);
-        queued.keyframe = packet.keyframe;
-        queued.pts = packet.pts;
-        queued.dts = packet.dts;
-
-        {
-            std::lock_guard<std::mutex> lock(queue_mtx_);
-            while (packet_queue_.size() >= max_queue_packets_) {
-                packet_queue_.pop_front();
-            }
-            packet_queue_.push_back(std::move(queued));
+        AVPacket* avpkt = av_packet_alloc();
+        if (avpkt == nullptr) {
+            return false;
         }
-        queue_cv_.notify_one();
+
+        int ret = av_new_packet(avpkt, static_cast<int>(packet.size));
+        if (ret < 0) {
+            av_packet_free(&avpkt);
+            PrintAvError("av_new_packet failed", ret);
+            return false;
+        }
+
+        std::memcpy(avpkt->data, packet.data, packet.size);
+
+        avpkt->stream_index = stream_->index;
+        avpkt->pts = packet.pts;
+        avpkt->dts = packet.dts;
+        avpkt->duration = av_rescale_q(1, AVRational{1, fps_}, stream_->time_base);
+        avpkt->pos = -1;
+
+        if (packet.keyframe) 
+        {
+            avpkt->flags |= AV_PKT_FLAG_KEY;
+        }
+
+        ret = av_interleaved_write_frame(fmt_ctx_, avpkt);
+
+        av_packet_free(&avpkt);
+
+        if (ret < 0) {
+            PrintAvError("av_interleaved_write_frame failed", ret);
+            return false;
+        }
+
         return true;
     }
 
     void Close() override
     {
-        worker_running_ = false;
-        queue_cv_.notify_all();
-        if (worker_thread_.joinable()) {
-            worker_thread_.join();
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(queue_mtx_);
-            packet_queue_.clear();
-        }
-
         if (fmt_ctx_) {
             if (started_) {
                 av_write_trailer(fmt_ctx_);
@@ -207,84 +210,11 @@ public:
     }
 
 private:
-    struct QueuedPacket 
+    static void PrintAvError(const char* prefix, int err)
     {
-        int channel_id = -1;
-        std::vector<uint8_t> data;
-        bool keyframe = false;
-        int64_t pts = 0;
-        int64_t dts = 0;
-    };
-
-    void WorkerLoop()
-    {
-        while (true) {
-            QueuedPacket packet;
-
-            {
-                std::unique_lock<std::mutex> lock(queue_mtx_);
-                queue_cv_.wait(lock, [this]() {
-                    return !worker_running_ || !packet_queue_.empty();
-                });
-
-                if (!worker_running_) {
-                    packet_queue_.clear();
-                    break;
-                }
-
-                if (packet_queue_.empty()) {
-                    continue;
-                }
-
-                packet = std::move(packet_queue_.front());
-                packet_queue_.pop_front();
-            }
-
-            WritePacket(packet);
-        }
-    }
-
-    bool WritePacket(const QueuedPacket& packet)
-    {
-        if (!started_ || fmt_ctx_ == nullptr || stream_ == nullptr || packet.data.empty()) {
-            return false;
-        }
-
-        AVPacket* avpkt = av_packet_alloc();
-        if (avpkt == nullptr) {
-            return false;
-        }
-
-        int ret = av_new_packet(avpkt, static_cast<int>(packet.data.size()));
-        if (ret < 0) {
-            av_packet_free(&avpkt);
-            printf("av_new_packet failed: %d\n", ret);
-            return false;
-        }
-
-        std::memcpy(avpkt->data, packet.data.data(), packet.data.size());
-
-        avpkt->stream_index = stream_->index;
-        avpkt->pts = packet.pts;
-        avpkt->dts = packet.dts;
-        avpkt->duration = 90000 / fps_;
-
-        if (packet.keyframe) 
-        {
-            avpkt->flags |= AV_PKT_FLAG_KEY;
-        }
-
-        ret = av_interleaved_write_frame(fmt_ctx_, avpkt);
-
-        av_packet_free(&avpkt);
-
-        if (ret < 0) {
-            printf("av_interleaved_write_frame failed: %d\n", ret);
-            return false;
-        }
-
-
-        return true;
+        char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+        av_strerror(err, errbuf, sizeof(errbuf));
+        printf("%s: %s (%d)\n", prefix, errbuf, err);
     }
 
     std::string url_;
@@ -292,12 +222,6 @@ private:
     int height_ = 0;
     int fps_ = 30;
     bool started_ = false;
-    std::atomic<bool> worker_running_{false};
-    std::thread worker_thread_;
-    std::mutex queue_mtx_;
-    std::condition_variable queue_cv_;
-    std::deque<QueuedPacket> packet_queue_;
-    size_t max_queue_packets_ = 60;
 
     AVFormatContext* fmt_ctx_ = nullptr;
     AVStream* stream_ = nullptr;

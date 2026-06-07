@@ -59,7 +59,7 @@ int main(int argc, char **argv)
             break;
         }
         
-        InferOutput out;
+        InferOutput out; 
         // 从全局 NPU 池中阻塞/非阻塞获取推理完成的结果
         if (testPool.get(out) == 0) 
         {
