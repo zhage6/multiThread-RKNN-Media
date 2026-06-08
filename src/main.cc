@@ -31,7 +31,7 @@ int main(int argc, char **argv)
 
     // 初始化rknn线程池/Initialize the rknn thread pool
     std::atomic<int> active_channels{2};
-    int threadNum = 3;
+    int threadNum = 6;
     int in_flight_frames = 0;
     rknnPool<rkYolov5s, input_data, InferOutput> testPool(model_name, threadNum);
     if (testPool.init() != 0)
@@ -41,7 +41,7 @@ int main(int argc, char **argv)
     }
     std::vector<std::shared_ptr<VideoChannel>> channels;
     channels.push_back(std::make_unique<VideoChannel>(0, "../test.h264", &testPool,active_channels));
-    channels.push_back(std::make_unique<VideoChannel>(1, "../test2.h264", &testPool,active_channels));
+    //channels.push_back(std::make_unique<VideoChannel>(1, "../test2.h264", &testPool,active_channels));
     
 
     for (auto& ch : channels) 

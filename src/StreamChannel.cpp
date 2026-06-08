@@ -1,4 +1,5 @@
 #include "StreamChannel.h"
+#include "TimingLogger.h"
 #include <algorithm>
 #include <chrono>
 
@@ -86,6 +87,10 @@ void VideoChannel::start()
             // 注意：如果池子满了，你的 m_pool->put 会阻塞，这天然形成了对当前解码线程的“反压”
             printf("一帧解码完成\n");
             this->m_pool->put(data); 
+            timing::Log("decode_enqueue ch=%d frame=%llu queue=%d",
+                        this->m_channel_id,
+                        static_cast<unsigned long long>(data.frame_id),
+                        this->m_pool->get_task_size());
         }, 
         MPP_VIDEO_CodingAVC    
         );
@@ -114,6 +119,11 @@ void VideoChannel::OnInferOutput(const InferOutput& out)
     {
         auto current_out = m_reorder_buffer[m_expected_frame_id];
         m_reorder_buffer.erase(m_expected_frame_id);
+        timing::Log("reorder_pop ch=%d frame=%llu reorder_left=%zu expected=%llu",
+                    m_channel_id,
+                    static_cast<unsigned long long>(current_out.frame_id),
+                    m_reorder_buffer.size(),
+                    static_cast<unsigned long long>(m_expected_frame_id));
 
         // ---> 核心：零拷贝推流到编码器 <---
         EncodeZeroCopy(current_out);
@@ -124,6 +134,11 @@ void VideoChannel::OnInferOutput(const InferOutput& out)
     // 4. 防爆内存保护 (防丢帧卡死)
     if (m_reorder_buffer.size() > 20) {
         printf("警告：通道 %d 出现严重丢帧！强制向前推进序号。\n", m_channel_id);
+        timing::Log("reorder_overflow ch=%d size=%zu old_expected=%llu new_expected=%llu",
+                    m_channel_id,
+                    m_reorder_buffer.size(),
+                    static_cast<unsigned long long>(m_expected_frame_id),
+                    static_cast<unsigned long long>(m_reorder_buffer.begin()->first));
         m_expected_frame_id = m_reorder_buffer.begin()->first;
     }
 }
@@ -176,12 +191,17 @@ void VideoChannel::InitEncoder(int width,int height,MppFrameFormat fmt)
     m_encoder->SetOutputCallback([this](const uint8_t* data, size_t size, bool is_keyframe) 
     {
         printf("编码器编码完成一帧\n");
+        auto callback_start = timing::Clock::now();
         const int fps = std::max(1, m_output_fps);
         const uint64_t frame_index = m_encode_packet_counter++;
 
         auto target_time = m_stream_start_time +
             std::chrono::microseconds(frame_index * 1000000 / fps);
+        auto before_sleep = timing::Clock::now();
+        long long wait_us = timing::UsBetween(before_sleep, target_time);
         std::this_thread::sleep_until(target_time);
+        auto after_sleep = timing::Clock::now();
+        long long late_us = timing::UsBetween(target_time, after_sleep);
 
         EncodedPacket packet;
         packet.channel_id = m_channel_id;
@@ -194,9 +214,23 @@ void VideoChannel::InitEncoder(int width,int height,MppFrameFormat fmt)
         }
         m_last_packet_pts = packet.pts;
         packet.dts = packet.pts;//时间戳
+        auto push_start = timing::Clock::now();
+        bool push_ok = false;
         if (m_publisher) {
-            m_publisher->Push(packet);
+            push_ok = m_publisher->Push(packet);
         }
+        auto push_end = timing::Clock::now();
+        timing::Log("packet_push ch=%d enc_frame=%llu size=%zu key=%d pts=%lld wait_us=%lld late_us=%lld push_us=%lld callback_us=%lld ok=%d",
+                    m_channel_id,
+                    static_cast<unsigned long long>(frame_index),
+                    size,
+                    is_keyframe ? 1 : 0,
+                    static_cast<long long>(packet.pts),
+                    wait_us > 0 ? wait_us : 0,
+                    late_us > 0 ? late_us : 0,
+                    timing::UsBetween(push_start, push_end),
+                    timing::UsBetween(callback_start, push_end),
+                    push_ok ? 1 : 0);
     });
 
     m_encoder->Start();
@@ -206,13 +240,23 @@ void VideoChannel::InitEncoder(int width,int height,MppFrameFormat fmt)
 
 void VideoChannel::EncodeZeroCopy(const InferOutput& out) 
 {
+    auto total_start = timing::Clock::now();
     if (out.src_buffer == nullptr || out.src_fd < 0) {
+        timing::Log("encode_input_drop ch=%d frame=%llu reason=bad_src",
+                    m_channel_id,
+                    static_cast<unsigned long long>(out.frame_id));
         release_source_buffer(out);
         return;
     }
 
+    auto get_buffer_start = timing::Clock::now();
     MppBuffer mpp_buf = m_encoder->GetFreeBuffer();
+    auto get_buffer_end = timing::Clock::now();
     if (mpp_buf == nullptr) {
+        timing::Log("encode_input_drop ch=%d frame=%llu reason=no_encoder_buffer wait_us=%lld",
+                    m_channel_id,
+                    static_cast<unsigned long long>(out.frame_id),
+                    timing::UsBetween(get_buffer_start, get_buffer_end));
         release_source_buffer(out);
         return;
     }
@@ -225,14 +269,23 @@ void VideoChannel::EncodeZeroCopy(const InferOutput& out)
                                          RK_FORMAT_YCbCr_420_SP,
                                          out.width, out.height);
 
+    auto copy_start = timing::Clock::now();
     IM_STATUS status = imcopy(src_img, dst_img);
+    auto copy_end = timing::Clock::now();
     if (status != IM_STATUS_SUCCESS) {
         printf("RGA 编码前拷贝失败: %s\n", imStrError(status));
+        timing::Log("encode_input_drop ch=%d frame=%llu reason=rga_copy_failed buffer_wait_us=%lld rga_copy_us=%lld",
+                    m_channel_id,
+                    static_cast<unsigned long long>(out.frame_id),
+                    timing::UsBetween(get_buffer_start, get_buffer_end),
+                    timing::UsBetween(copy_start, copy_end));
         m_encoder->RecycleBuffer(mpp_buf);
         release_source_buffer(out);
         return;
     }
 
+    int drawn_boxes = 0;
+    auto draw_start = timing::Clock::now();
     for (int i = 0; i < out.results.count; ++i) {
         const auto& res = out.results.results[i];
         int left = align_down_even(clamp_to_range(res.box.left, 0, out.width - 2));
@@ -249,9 +302,24 @@ void VideoChannel::EncodeZeroCopy(const InferOutput& out)
         status = imrectangle(dst_img, rect, 0x0000ff00, 4);
         if (status != IM_STATUS_SUCCESS) {
             printf("RGA 画框失败: %s\n", imStrError(status));
+        } else {
+            drawn_boxes++;
         }
     }
+    auto draw_end = timing::Clock::now();
 
+    auto push_start = timing::Clock::now();
     m_encoder->PushBuffer(mpp_buf);
+    auto push_end = timing::Clock::now();
     release_source_buffer(out);
+
+    timing::Log("encode_input ch=%d frame=%llu boxes=%d buffer_wait_us=%lld rga_copy_us=%lld draw_us=%lld enc_put_us=%lld total_us=%lld",
+                m_channel_id,
+                static_cast<unsigned long long>(out.frame_id),
+                drawn_boxes,
+                timing::UsBetween(get_buffer_start, get_buffer_end),
+                timing::UsBetween(copy_start, copy_end),
+                timing::UsBetween(draw_start, draw_end),
+                timing::UsBetween(push_start, push_end),
+                timing::UsBetween(total_start, timing::Clock::now()));
 }

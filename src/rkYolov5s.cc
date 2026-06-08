@@ -10,6 +10,7 @@
 
 #include "coreNum.hpp"
 #include "rkYolov5s.hpp"
+#include "TimingLogger.h"
 
 static void dump_tensor_attr(rknn_tensor_attr *attr)
 {
@@ -286,7 +287,9 @@ int process_rga_zero_copy(int src_fd, int src_w, int src_h, int src_w_stride, in
 
 InferOutput rkYolov5s::infer(input_data data)
 {
+    auto total_start = timing::Clock::now();
     std::lock_guard<std::mutex> lock(mtx);
+    auto lock_acquired = timing::Clock::now();
 
 
     int dst_fd = input_mems[0]->fd; 
@@ -294,10 +297,12 @@ InferOutput rkYolov5s::infer(input_data data)
     // 2. 【核心 0 拷贝动作】：呼叫 RGA！
     // 将 MPP 的 YUV(src_fd) 直接转码缩放进我的 RGB(dst_fd) 专属模具里
     int dst_w_stride = input_attrs[0].w_stride > 0 ? input_attrs[0].w_stride : width;
+    auto rga_start = timing::Clock::now();
     int rga_ret = process_rga_zero_copy(
         data.src_fd, data.width, data.height, data.hor_stride, data.ver_stride,
         dst_fd, width, height, dst_w_stride, height // width 和 height 是 YOLO 模型的 640x640
     );
+    auto rga_end = timing::Clock::now();
 
     if (data.frame != nullptr) {
         mpp_frame_deinit(&data.frame); //归还frame
@@ -324,6 +329,12 @@ InferOutput rkYolov5s::infer(input_data data)
             mpp_buffer_put(data.src_buffer);
             out.src_buffer = nullptr;
         }
+        timing::Log("rknn_infer_drop ch=%d frame=%llu reason=rga_pre_failed lock_wait_us=%lld rga_pre_us=%lld total_us=%lld",
+                    data.channel_id,
+                    static_cast<unsigned long long>(data.frame_id),
+                    timing::UsBetween(total_start, lock_acquired),
+                    timing::UsBetween(rga_start, rga_end),
+                    timing::UsBetween(total_start, timing::Clock::now()));
         return out;
     }
 
@@ -335,8 +346,12 @@ InferOutput rkYolov5s::infer(input_data data)
     }
 
     // 模型推理/Model inference
+    auto run_start = timing::Clock::now();
     ret = rknn_run(ctx, NULL);
+    auto run_end = timing::Clock::now();
+    auto outputs_get_start = timing::Clock::now();
     ret = rknn_outputs_get(ctx, io_num.n_output, outputs, NULL);
+    auto outputs_get_end = timing::Clock::now();
 
     // 计算缩放比例 (模型输入大小 / 原始视频帧大小)
     float scale_w = (float)width / data.width;
@@ -354,8 +369,10 @@ InferOutput rkYolov5s::infer(input_data data)
         out_scales.push_back(output_attrs[i].scale);
         out_zps.push_back(output_attrs[i].zp);
     }
+    auto post_start = timing::Clock::now();
     post_process((int8_t *)outputs[0].buf, (int8_t *)outputs[1].buf, (int8_t *)outputs[2].buf, height, width,
                  box_conf_threshold, nms_threshold, pads, scale_w, scale_h, out_zps, out_scales, &detect_result_group);
+    auto post_end = timing::Clock::now();
 
     // // 绘制框体/Draw the box
     // char text[256];
@@ -374,8 +391,21 @@ InferOutput rkYolov5s::infer(input_data data)
     //     putText(orig_img, text, cv::Point(x1, y1 + 12), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 255));
     // }
 
+    auto release_start = timing::Clock::now();
     ret = rknn_outputs_release(ctx, io_num.n_output, outputs);
+    auto release_end = timing::Clock::now();
     out.results = detect_result_group;
+    timing::Log("rknn_infer ch=%d frame=%llu lock_wait_us=%lld rga_pre_us=%lld run_us=%lld outputs_get_us=%lld post_us=%lld release_us=%lld total_us=%lld boxes=%d",
+                data.channel_id,
+                static_cast<unsigned long long>(data.frame_id),
+                timing::UsBetween(total_start, lock_acquired),
+                timing::UsBetween(rga_start, rga_end),
+                timing::UsBetween(run_start, run_end),
+                timing::UsBetween(outputs_get_start, outputs_get_end),
+                timing::UsBetween(post_start, post_end),
+                timing::UsBetween(release_start, release_end),
+                timing::UsBetween(total_start, timing::Clock::now()),
+                detect_result_group.count);
     return out;
 }
 
