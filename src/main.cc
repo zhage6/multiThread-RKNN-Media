@@ -41,7 +41,7 @@ int main(int argc, char **argv)
     }
     std::vector<std::shared_ptr<VideoChannel>> channels;
     channels.push_back(std::make_unique<VideoChannel>(0, "../test.h264", &testPool,active_channels));
-    //channels.push_back(std::make_unique<VideoChannel>(1, "../test2.h264", &testPool,active_channels));
+    channels.push_back(std::make_unique<VideoChannel>(1, "../test2.h264", &testPool,active_channels));
     
 
     for (auto& ch : channels) 
