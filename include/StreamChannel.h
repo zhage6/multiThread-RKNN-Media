@@ -70,6 +70,4 @@ class VideoChannel
         std::chrono::steady_clock::time_point m_stream_start_time;
 
 
-
-
 };

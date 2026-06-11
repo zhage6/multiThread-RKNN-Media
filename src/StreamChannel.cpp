@@ -73,7 +73,8 @@ void VideoChannel::start()
             input_data data;
             data.src_fd = src_fd; 
             data.src_buffer = mpp_frame_get_buffer(frame);
-            if (data.src_buffer) {
+            if (data.src_buffer) 
+            {
                 mpp_buffer_inc_ref(data.src_buffer);
             }
             data.width = w;

@@ -54,8 +54,9 @@ int main(int argc, char **argv)
     while (true) 
     {
         // 如果所有通道都已经关闭或异常退出，主线程结束
-        if (active_channels == 0) {
-            printf("所有通道已关闭，退出主循环。\n");
+       if (active_channels == 0 && testPool.get_task_size() == 0) 
+        {
+            printf("所有通道已关闭，推理结果已消费完，退出主循环。\n");
             break;
         }
         

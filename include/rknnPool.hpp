@@ -6,6 +6,8 @@
 #include <iostream>
 #include <mutex>
 #include <queue> 
+#include <atomic>
+#include <chrono>
 // rknnModel模型类, inputType模型输入类型, outputType模型输出类型
 template <typename rknnModel, typename inputType, typename outputType>
 class rknnPool
@@ -17,7 +19,8 @@ private:
     long long id;
     std::mutex idMtx, queueMtx;
     std::unique_ptr<dpool::ThreadPool> pool;//初始化线程池哦
-    std::queue<std::future<outputType>> futs;
+    std::queue<outputType> completed_outputs;
+    std::atomic<int> pending_count{0};
     std::vector<std::shared_ptr<rknnModel>> models;
 
 protected:
@@ -32,8 +35,7 @@ public:
     int get(outputType &outputData);
     int get_task_size() 
     {
-        std::lock_guard<std::mutex> lock(queueMtx); 
-        return futs.size();                  
+        return pending_count.load();
     }
     
     ~rknnPool();
@@ -82,10 +84,21 @@ int rknnPool<rknnModel, inputType, outputType>::getModelId()
 }
 
 template <typename rknnModel, typename inputType, typename outputType>
+
 int rknnPool<rknnModel, inputType, outputType>::put(inputType inputData)
 {
-    std::lock_guard<std::mutex> lock(queueMtx);
-    futs.push(pool->submit(&rknnModel::infer, models[this->getModelId()], inputData));
+    auto model = models[this->getModelId()];
+    pending_count++;
+
+    pool->submit([this, model, inputData]() mutable 
+    {
+        outputType output = model->infer(inputData);
+        {
+            std::lock_guard<std::mutex> lock(queueMtx);
+            completed_outputs.push(std::move(output));
+        }
+    });
+
     return 0;
 }
 
@@ -93,20 +106,27 @@ template <typename rknnModel, typename inputType, typename outputType>
 int rknnPool<rknnModel, inputType, outputType>::get(outputType &outputData)
 {
     std::lock_guard<std::mutex> lock(queueMtx);
-    if(futs.empty() == true)
+
+    if (completed_outputs.empty())
+    {
         return 1;
-    outputData = futs.front().get();
-    futs.pop();
+    }
+    outputData = std::move(completed_outputs.front());
+    completed_outputs.pop();
+    pending_count--;
+
     return 0;
 }
 
 template <typename rknnModel, typename inputType, typename outputType>
 rknnPool<rknnModel, inputType, outputType>::~rknnPool()
 {
-    while (!futs.empty())
+    while (pending_count.load() > 0)
     {
-        outputType temp = futs.front().get();
-        futs.pop();
+        outputType temp;
+        if (get(temp) != 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
 }
 
