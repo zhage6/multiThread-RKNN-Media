@@ -65,12 +65,18 @@ int main(int argc, char **argv)
         if (testPool.get(out) == 0) 
         {
             // 过滤掉无效帧（比如解码错误或模型处理失败的帧）
-            if(out.frame_id == -1) {
-                if (out.src_buffer) {
+           if (out.frame_id == static_cast<uint64_t>(-1)) 
+            {
+                if (out.channel_id >= 0 && out.channel_id < channels.size()) 
+                {
+                    channels[out.channel_id]->OnInferDropped();
+                }
+                if (out.src_buffer) 
+                {
                     mpp_buffer_put(out.src_buffer);
                 }
                 continue;
-            }
+        }
 
             // ===================================================================
             // 核心优化 4：O(1) 数组下标直接映射 + 防爆护盾

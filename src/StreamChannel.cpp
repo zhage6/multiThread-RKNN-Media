@@ -41,7 +41,12 @@ VideoChannel::VideoChannel(int channel_id, const std::string& stream_url,
           m_encoder(nullptr),
           m_encode_packet_counter(0),
           m_last_packet_pts(-1),
-          m_output_fps(24)
+          m_output_fps(24),
+          m_reorder_waiting(false),
+          m_reorder_timeout(std::chrono::milliseconds(120)),
+          m_reorder_drop_count(0),
+          m_inflight_frames(0),
+          m_max_inflight_frames(8)   //每路最大帧
 {
     // 实例化该通道专属的 MPP 解码器
     m_decoder = new MppDecoder();
@@ -87,6 +92,23 @@ void VideoChannel::start()
             // 塞入全局共享的 RKNN 线程池！
             // 注意：如果池子满了，你的 m_pool->put 会阻塞，这天然形成了对当前解码线程的“反压”
             printf("一帧解码完成\n");
+            if (m_inflight_frames.load() >= m_max_inflight_frames) 
+            {
+                printf("通道 %d 解码回调兜底丢弃 frame %llu\n",
+                    m_channel_id,
+                    static_cast<unsigned long long>(data.frame_id));
+                if (data.frame) 
+                {
+                    mpp_frame_deinit(&data.frame);
+                    data.frame = nullptr;
+                }    
+                if (data.src_buffer) 
+                {
+                    mpp_buffer_put(data.src_buffer);
+                }
+                return;
+            }
+            m_inflight_frames++;
             this->m_pool->put(data); 
             timing::Log("decode_enqueue ch=%d frame=%llu queue=%d",
                         this->m_channel_id,
@@ -95,54 +117,153 @@ void VideoChannel::start()
         }, 
         MPP_VIDEO_CodingAVC    
         );
+        m_output_thread = std::thread(&VideoChannel::OutputLoop, this);
         m_decode_thread = std::thread(&VideoChannel::DecodeLoop, this);
 }
 void VideoChannel::Stop() 
 {
     m_running = false;
-    if (m_decode_thread.joinable()) m_decode_thread.join();
+    m_output_queue.stop();
+
+    if (m_decode_thread.joinable()) {
+        m_decode_thread.join();
+    }
+
+    if (m_output_thread.joinable()) {
+        m_output_thread.join();
+    }
 }
+
+
 void VideoChannel::OnInferOutput(const InferOutput& out) 
 {
-    std::lock_guard<std::mutex> lock(m_reorder_mtx);
+    m_inflight_frames--;
+    if (!m_output_queue.push(out)) {
+        printf("警告：通道 %d 输出队列满，丢弃 frame %llu\n",
+               m_channel_id,
+               static_cast<unsigned long long>(out.frame_id));
 
-    // 1. 延迟初始化编码器 (在这里我们才能确定图像真正的宽高)
+        if (out.src_buffer) {
+            mpp_buffer_put(out.src_buffer);
+        }
+    }
+}
+
+void VideoChannel::OutputLoop()
+{
+    InferOutput out;
+    while (m_output_queue.pop(out)) {
+        ProcessInferOutput(out);
+    }
+}
+
+
+void VideoChannel::ProcessInferOutput(const InferOutput& out) 
+{
+   std::lock_guard<std::mutex> lock(m_reorder_mtx);
+
+    // 已经被跳过的迟到帧，直接丢掉，不能再进入 reorder。
+    if (out.frame_id < m_expected_frame_id) {
+        timing::Log("reorder_late_drop ch=%d frame=%llu expected=%llu",
+                    m_channel_id,
+                    static_cast<unsigned long long>(out.frame_id),
+                    static_cast<unsigned long long>(m_expected_frame_id));
+        release_source_buffer(out);
+        return;
+    }
+
     if (m_encoder == nullptr) 
     {
         InitEncoder(out.width, out.height, MPP_FMT_YUV420SP);
     }
 
-    // 2. 放入重排缓冲区
-    m_reorder_buffer[out.frame_id] = out;
-
-    // 3. 顺序消费逻辑
-    while (m_reorder_buffer.count(m_expected_frame_id) > 0) 
+    auto old = m_reorder_buffer.find(out.frame_id);
+    if (old != m_reorder_buffer.end()) {
+        release_source_buffer(old->second);
+        old->second = out;
+    } else 
     {
-        auto current_out = m_reorder_buffer[m_expected_frame_id];
-        m_reorder_buffer.erase(m_expected_frame_id);
-        timing::Log("reorder_pop ch=%d frame=%llu reorder_left=%zu expected=%llu",
-                    m_channel_id,
-                    static_cast<unsigned long long>(current_out.frame_id),
-                    m_reorder_buffer.size(),
-                    static_cast<unsigned long long>(m_expected_frame_id));
-
-        // ---> 核心：零拷贝推流到编码器 <---
-        EncodeZeroCopy(current_out);
-
-        m_expected_frame_id++;
+        m_reorder_buffer[out.frame_id] = out;
     }
 
-    // 4. 防爆内存保护 (防丢帧卡死)
+    while (true)
+    {
+        auto it = m_reorder_buffer.find(m_expected_frame_id);
+
+        if (it != m_reorder_buffer.end())
+        {
+            auto current_out = it->second;
+            m_reorder_buffer.erase(it);
+
+            m_reorder_waiting = false;
+
+            timing::Log("reorder_pop ch=%d frame=%llu reorder_left=%zu expected=%llu",
+                        m_channel_id,
+                        static_cast<unsigned long long>(current_out.frame_id),
+                        m_reorder_buffer.size(),
+                        static_cast<unsigned long long>(m_expected_frame_id));
+
+            EncodeZeroCopy(current_out);
+            m_expected_frame_id++;
+            continue;
+        }
+
+        if (m_reorder_buffer.empty()) {
+            m_reorder_waiting = false;
+            break;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+
+        if (!m_reorder_waiting) {
+            m_reorder_waiting = true;
+            m_reorder_wait_start = now;
+            break;
+        }
+
+        auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - m_reorder_wait_start);
+
+        if (waited >= m_reorder_timeout) {
+            timing::Log("reorder_timeout_drop ch=%d missing=%llu waited_ms=%lld next_ready=%llu reorder_size=%zu drop_count=%llu",
+                        m_channel_id,
+                        static_cast<unsigned long long>(m_expected_frame_id),
+                        static_cast<long long>(waited.count()),
+                        static_cast<unsigned long long>(m_reorder_buffer.begin()->first),
+                        m_reorder_buffer.size(),
+                        static_cast<unsigned long long>(m_reorder_drop_count + 1));
+
+            printf("警告：通道 %d 等待 frame %llu 超时，跳过。\n",
+                   m_channel_id,
+                   static_cast<unsigned long long>(m_expected_frame_id));
+
+            m_expected_frame_id++;
+            m_reorder_drop_count++;
+            m_reorder_waiting = false;
+            continue;
+        }
+
+        break;
+    }
+
     if (m_reorder_buffer.size() > 20) {
-        printf("警告：通道 %d 出现严重丢帧！强制向前推进序号。\n", m_channel_id);
+        uint64_t new_expected = m_reorder_buffer.begin()->first;
+
         timing::Log("reorder_overflow ch=%d size=%zu old_expected=%llu new_expected=%llu",
                     m_channel_id,
                     m_reorder_buffer.size(),
                     static_cast<unsigned long long>(m_expected_frame_id),
-                    static_cast<unsigned long long>(m_reorder_buffer.begin()->first));
-        m_expected_frame_id = m_reorder_buffer.begin()->first;
+                    static_cast<unsigned long long>(new_expected));
+
+        printf("警告：通道 %d reorder 堆积过多，强制跳到 frame %llu。\n",
+               m_channel_id,
+               static_cast<unsigned long long>(new_expected));
+
+        m_expected_frame_id = new_expected;
+        m_reorder_waiting = false;
     }
 }
+
 void VideoChannel::DecodeLoop()
 {
     FILE* fp = fopen(m_stream_url.c_str(), "rb");
@@ -154,11 +275,22 @@ void VideoChannel::DecodeLoop()
     unsigned char buffer[4096];
     while (m_running && !feof(fp)) 
     {
-        while (m_pool->get_task_size() >= 20) //临时控速
+        while (m_running && m_inflight_frames.load() >= m_max_inflight_frames)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (!m_running) {
+            break;
+        }
+
+        while (m_pool->get_task_size() >= 40) //临时控速
         {
         // 如果池子满了，强行让当前读取线程睡 5 毫秒
         // 这样就不会继续往外吐 frame，MPP 解码器也就停下来了，内存涨幅瞬间停止！
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (!m_running) {
+            break;
         }
         size_t bytes_read = fread(buffer, 1, sizeof(buffer), fp);
         if (bytes_read > 0) 
@@ -323,4 +455,11 @@ void VideoChannel::EncodeZeroCopy(const InferOutput& out)
                 timing::UsBetween(draw_start, draw_end),
                 timing::UsBetween(push_start, push_end),
                 timing::UsBetween(total_start, timing::Clock::now()));
+}
+
+void VideoChannel::OnInferDropped()
+{
+    if (m_inflight_frames.load() > 0) {
+        m_inflight_frames--;
+    }
 }

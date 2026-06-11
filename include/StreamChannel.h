@@ -9,6 +9,7 @@
 #include "rknnPool.hpp"
 #include "rkYolov5s.hpp"
 #include "StreamPublisher.h"
+#include "ThreadSafeQueue.hpp"
 
 
 struct DetectResult {
@@ -41,10 +42,13 @@ class VideoChannel
         void start();
         void Stop();
         void OnInferOutput(const InferOutput& out);
+        void OnInferDropped();
 
     private: 
         void DecodeLoop();
         void InitEncoder(int width,int height,MppFrameFormat fmt);
+        void ProcessInferOutput(const InferOutput& out);
+        void OutputLoop();
         void EncodeZeroCopy(const InferOutput& out);
 
 
@@ -52,6 +56,8 @@ class VideoChannel
         std::string m_stream_url; //输入流地址，可以是本地文件路径，也可以是网络 RTSP 地址
         MppDecoder* m_decoder; //解码器对象
         std::thread m_decode_thread; //解码线程
+        std::thread m_output_thread;
+        ThreadSafeQueue<InferOutput> m_output_queue{30};
         std::atomic<bool> m_running; //线程控制标志
         uint64_t m_frame_counter; //帧计数器
         GlobalPool* m_pool; //指向全局线程池的指针 
@@ -68,6 +74,15 @@ class VideoChannel
         int64_t m_last_packet_pts;
         int m_output_fps;
         std::chrono::steady_clock::time_point m_stream_start_time;
+
+
+        bool m_reorder_waiting;
+        std::chrono::steady_clock::time_point m_reorder_wait_start;
+        uint64_t m_reorder_drop_count;
+        std::chrono::milliseconds m_reorder_timeout;
+
+        std::atomic<int> m_inflight_frames;
+        int m_max_inflight_frames;
 
 
 };
