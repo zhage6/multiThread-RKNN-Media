@@ -31,7 +31,7 @@ int main(int argc, char **argv)
 
     // 初始化rknn线程池/Initialize the rknn thread pool
     std::atomic<int> active_channels{2};
-    int threadNum = 6;
+    int threadNum = 12;
     int in_flight_frames = 0;
     rknnPool<rkYolov5s, input_data, InferOutput> testPool(model_name, threadNum);
     if (testPool.init() != 0)
@@ -42,6 +42,12 @@ int main(int argc, char **argv)
     std::vector<std::shared_ptr<VideoChannel>> channels;
     channels.push_back(std::make_unique<VideoChannel>(0, "../test.h264", &testPool,active_channels));
     channels.push_back(std::make_unique<VideoChannel>(1, "../test2.h264", &testPool,active_channels));
+    channels.push_back(std::make_unique<VideoChannel>(2, "../test3.h264", &testPool,active_channels));
+    channels.push_back(std::make_unique<VideoChannel>(3, "../test4.h264", &testPool,active_channels));
+    channels.push_back(std::make_unique<VideoChannel>(4, "../test5.h264", &testPool,active_channels));
+    channels.push_back(std::make_unique<VideoChannel>(5, "../test6.h264", &testPool,active_channels));
+    
+    
     
 
     for (auto& ch : channels) 
@@ -76,7 +82,7 @@ int main(int argc, char **argv)
                     mpp_buffer_put(out.src_buffer);
                 }
                 continue;
-        }
+            }
 
             // ===================================================================
             // 核心优化 4：O(1) 数组下标直接映射 + 防爆护盾

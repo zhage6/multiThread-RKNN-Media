@@ -41,12 +41,14 @@ VideoChannel::VideoChannel(int channel_id, const std::string& stream_url,
           m_encoder(nullptr),
           m_encode_packet_counter(0),
           m_last_packet_pts(-1),
-          m_output_fps(24),
+          m_output_fps(30),
           m_reorder_waiting(false),
           m_reorder_timeout(std::chrono::milliseconds(120)),
           m_reorder_drop_count(0),
           m_inflight_frames(0),
-          m_max_inflight_frames(8)   //每路最大帧
+          m_max_inflight_frames(8),   //每路最大帧
+          m_encoder_ready(false),
+          m_startup_max_inflight_frames(2)
 {
     // 实例化该通道专属的 MPP 解码器
     m_decoder = new MppDecoder();
@@ -92,22 +94,31 @@ void VideoChannel::start()
             // 塞入全局共享的 RKNN 线程池！
             // 注意：如果池子满了，你的 m_pool->put 会阻塞，这天然形成了对当前解码线程的“反压”
             printf("一帧解码完成\n");
-            if (m_inflight_frames.load() >= m_max_inflight_frames) 
+            while (m_running)
             {
-                printf("通道 %d 解码回调兜底丢弃 frame %llu\n",
-                    m_channel_id,
-                    static_cast<unsigned long long>(data.frame_id));
-                if (data.frame) 
-                {
+                int max_inflight = m_encoder_ready.load()
+                    ? m_max_inflight_frames
+                    : m_startup_max_inflight_frames;
+
+                if (m_inflight_frames.load() < max_inflight) {
+                    break;
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+
+            if (!m_running) {
+                if (data.frame) {
                     mpp_frame_deinit(&data.frame);
                     data.frame = nullptr;
-                }    
-                if (data.src_buffer) 
-                {
+                }
+                if (data.src_buffer) {
                     mpp_buffer_put(data.src_buffer);
+                    data.src_buffer = nullptr;
                 }
                 return;
             }
+
             m_inflight_frames++;
             this->m_pool->put(data); 
             timing::Log("decode_enqueue ch=%d frame=%llu queue=%d",
@@ -123,6 +134,7 @@ void VideoChannel::start()
 void VideoChannel::Stop() 
 {
     m_running = false;
+    m_encoder_ready = false;
     m_output_queue.stop();
 
     if (m_decode_thread.joinable()) {
@@ -275,12 +287,18 @@ void VideoChannel::DecodeLoop()
     unsigned char buffer[4096];
     while (m_running && !feof(fp)) 
     {
-        while (m_running && m_inflight_frames.load() >= m_max_inflight_frames)
+        while (m_running)
         {
+            int max_inflight = m_encoder_ready.load()
+                ? m_max_inflight_frames
+                : m_startup_max_inflight_frames;
+
+            if (m_inflight_frames.load() < max_inflight) 
+            {
+                break;
+            }
+
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
-        if (!m_running) {
-            break;
         }
 
         while (m_pool->get_task_size() >= 40) //临时控速
@@ -367,6 +385,7 @@ void VideoChannel::InitEncoder(int width,int height,MppFrameFormat fmt)
     });
 
     m_encoder->Start();
+    m_encoder_ready = true;
     printf("\n通道 %d 的硬件编码器启动成功！\n", m_channel_id);
     
 }

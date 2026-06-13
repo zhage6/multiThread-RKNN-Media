@@ -84,5 +84,7 @@ class VideoChannel
         std::atomic<int> m_inflight_frames;
         int m_max_inflight_frames;
 
+        std::atomic<bool> m_encoder_ready; //热身变量，系统等待编码器链路打通
+        int m_startup_max_inflight_frames;
 
 };
