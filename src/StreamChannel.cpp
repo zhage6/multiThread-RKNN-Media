@@ -84,6 +84,11 @@ void VideoChannel::start()
             {
                 mpp_buffer_inc_ref(data.src_buffer); //后面的fd还需要继续的进行RGA，暂时不要释放
             }
+
+            if (m_encoder == nullptr) 
+            {
+                InitEncoder(w, h, MPP_FMT_YUV420SP);
+            }
             data.width = w;
             data.height = h;
             data.hor_stride = h_stride;
@@ -185,11 +190,6 @@ void VideoChannel::ProcessInferOutput(const InferOutput& out)
                     static_cast<unsigned long long>(m_expected_frame_id));
         release_source_buffer(out);
         return;
-    }
-
-    if (m_encoder == nullptr) 
-    {
-        InitEncoder(out.width, out.height, MPP_FMT_YUV420SP);
     }
 
     auto old = m_reorder_buffer.find(out.frame_id);
@@ -411,7 +411,8 @@ void VideoChannel::EncodeZeroCopy(const InferOutput& out)
     auto get_buffer_start = timing::Clock::now();
     MppBuffer mpp_buf = m_encoder->GetFreeBuffer();
     auto get_buffer_end = timing::Clock::now();
-    if (mpp_buf == nullptr) {
+    if (mpp_buf == nullptr) 
+    {
         timing::Log("encode_input_drop ch=%d frame=%llu reason=no_encoder_buffer wait_us=%lld",
                     m_channel_id,
                     static_cast<unsigned long long>(out.frame_id),

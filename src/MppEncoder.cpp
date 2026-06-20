@@ -85,10 +85,10 @@ bool RkMppEncoder::Init(int width, int height, MppFrameFormat fmt, MppCodingType
     // 设置帧率
     mpp_enc_cfg_set_s32(cfg_, "rc:fps_in_flex", 0);
     mpp_enc_cfg_set_s32(cfg_, "rc:fps_in_num", fps_in);
-    mpp_enc_cfg_set_s32(cfg_, "rc:fps_in_den", 1);
+    mpp_enc_cfg_set_s32(cfg_, "rc:fps_in_denorm", 1);
     mpp_enc_cfg_set_s32(cfg_, "rc:fps_out_flex", 0);
     mpp_enc_cfg_set_s32(cfg_, "rc:fps_out_num", fps_out);
-    mpp_enc_cfg_set_s32(cfg_, "rc:fps_out_den", 1);
+    mpp_enc_cfg_set_s32(cfg_, "rc:fps_out_denorm", 1);
     
     // 设置码率 (bps_target 是目标码率，bps_max/min 是浮动范围)
     mpp_enc_cfg_set_s32(cfg_, "rc:bps_target", bps);
@@ -102,7 +102,8 @@ bool RkMppEncoder::Init(int width, int height, MppFrameFormat fmt, MppCodingType
 
     // 4. 【最关键的一步】将配置好的 cfg 下发给硬件！
     ret = mpi_->control(ctx_, MPP_ENC_SET_CFG, cfg_);
-    if (ret != MPP_OK) {
+    if (ret != MPP_OK) 
+    {
         printf("Encoder set cfg 失败 ret=%d\n", ret);
         Stop();
         return false;
@@ -263,7 +264,8 @@ void RkMppEncoder::OutputThreadFunc()
 
 void RkMppEncoder::RecycleBuffer(MppBuffer buffer)
 {
-    if (buffer == nullptr) {
+    if (buffer == nullptr) 
+    {
         return;
     }
 
@@ -288,7 +290,8 @@ void RkMppEncoder::RecycleEncodedFrame(MppFrame frame)
 void RkMppEncoder::RemovePendingFrame(MppFrame frame)
 {
     std::lock_guard<std::mutex> lock(mtx_);
-    for (auto it = pending_frames_.begin(); it != pending_frames_.end(); ++it) {
+    for (auto it = pending_frames_.begin(); it != pending_frames_.end(); ++it) 
+    {
         if (*it == frame) {
             pending_frames_.erase(it);
             return;
@@ -418,12 +421,6 @@ bool RkMppEncoder::AllocateExternalBuffers(size_t frame_size, int count)
         }
 
         external_buffers_.push_back(ext_buf);
-    }
-
-    ret = mpp_buffer_group_limit_config(buf_grp_, frame_size, count);
-    if (ret != MPP_OK) {
-        printf("Encoder MPP buffer group limit 配置失败 ret=%d\n", ret);
-        return false;
     }
 
     printf("Encoder 已分配并 commit %d 块 DMA32 输入 buffer。\n", count);
