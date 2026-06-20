@@ -109,10 +109,10 @@ namespace dpool
                                                      std::chrono::seconds(WAIT_SECONDS),
                                                      [this]()
                                                      {
-                                                         return quit_ || !tasks_.empty();
+                                                         return quit_ || !tasks_.empty();//返回退出或者任务为空的状态
                                                      });
                     --idleThreads_;
-                    if (tasks_.empty()) 
+                    if (tasks_.empty()) //如果超时了且任务队列为空，就直接回收线程，如果任务队列不为空就取执行任务
                     {
                         if (quit_)
                         {
@@ -145,8 +145,8 @@ namespace dpool
                 assert(iter != threads_.end());
                 assert(iter->second.joinable());
 
-                iter->second.join();
-                threads_.erase(iter);
+                iter->second.join();//回收线程
+                threads_.erase(iter);//移除对象
             }
         }
 

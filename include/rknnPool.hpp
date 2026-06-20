@@ -54,7 +54,7 @@ int rknnPool<rknnModel, inputType, outputType>::init()
 {
     try
     {
-        this->pool = std::make_unique<dpool::ThreadPool>(this->threadNum);
+        this->pool = std::make_unique<dpool::ThreadPool>(this->threadNum); //在这里初始化了线程池
         for (int i = 0; i < this->threadNum; i++)
             models.push_back(std::make_shared<rknnModel>(this->modelPath.c_str()));//一个model就是一个rknn对象
     }

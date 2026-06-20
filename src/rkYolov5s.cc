@@ -292,7 +292,7 @@ InferOutput rkYolov5s::infer(input_data data)
     auto lock_acquired = timing::Clock::now();
 
 
-    int dst_fd = input_mems[0]->fd; 
+    int dst_fd = input_mems[0]->fd;   //这一步相当于把输入的fd转换出来
 
     // 2. 【核心 0 拷贝动作】：呼叫 RGA！
     // 将 MPP 的 YUV(src_fd) 直接转码缩放进我的 RGB(dst_fd) 专属模具里
@@ -301,11 +301,11 @@ InferOutput rkYolov5s::infer(input_data data)
     int rga_ret = process_rga_zero_copy(
         data.src_fd, data.width, data.height, data.hor_stride, data.ver_stride,
         dst_fd, width, height, dst_w_stride, height // width 和 height 是 YOLO 模型的 640x640
-    );
+    ); //相当于做了内存的不断覆盖
     auto rga_end = timing::Clock::now();
 
     if (data.frame != nullptr) {
-        mpp_frame_deinit(&data.frame); //归还frame
+        mpp_frame_deinit(&data.frame); //归还frame，但是buffer还没归还
         data.frame = nullptr;
     }
     
@@ -321,11 +321,13 @@ InferOutput rkYolov5s::infer(input_data data)
     out.height = data.height;
     out.hor_stride = data.hor_stride;
     out.ver_stride = data.ver_stride;
-    if (rga_ret != 0) {
+    if (rga_ret != 0) 
+    {
         printf("RGA 搬运失败，丢弃该帧\n");
         out.results = detect_result_group;
         out.frame_id = -1;     // 贴上序号标签
-        if (data.src_buffer) {
+        if (data.src_buffer) 
+        {
             mpp_buffer_put(data.src_buffer);
             out.src_buffer = nullptr;
         }
@@ -373,23 +375,6 @@ InferOutput rkYolov5s::infer(input_data data)
     post_process((int8_t *)outputs[0].buf, (int8_t *)outputs[1].buf, (int8_t *)outputs[2].buf, height, width,
                  box_conf_threshold, nms_threshold, pads, scale_w, scale_h, out_zps, out_scales, &detect_result_group);
     auto post_end = timing::Clock::now();
-
-    // // 绘制框体/Draw the box
-    // char text[256];
-    // for (int i = 0; i < detect_result_group.count; i++)
-    // {
-    //     detect_result_t *det_result = &(detect_result_group.results[i]);
-    //     sprintf(text, "%s %.1f%%", det_result->name, det_result->prop * 100);
-    //     // 打印预测物体的信息/Prints information about the predicted object
-    //     // printf("%s @ (%d %d %d %d) %f\n", det_result->name, det_result->box.left, det_result->box.top,
-    //     //        det_result->box.right, det_result->box.bottom, det_result->prop);
-    //     int x1 = det_result->box.left;
-    //     int y1 = det_result->box.top;
-    //     int x2 = det_result->box.right;
-    //     int y2 = det_result->box.bottom;
-    //     rectangle(orig_img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(256, 0, 0, 256), 3);
-    //     putText(orig_img, text, cv::Point(x1, y1 + 12), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 255));
-    // }
 
     auto release_start = timing::Clock::now();
     ret = rknn_outputs_release(ctx, io_num.n_output, outputs);

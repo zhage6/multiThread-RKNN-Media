@@ -2,7 +2,6 @@
 #include <mutex>
 #include <condition_variable>
 #include <deque>
-#include <queue>
 #include <functional>
 #include <vector>
 #include <atomic>
@@ -25,6 +24,8 @@ public:
     RkMppEncoder();
     ~RkMppEncoder();
     MppBuffer GetFreeBuffer();
+    int GetHorStride() const { return hor_stride_; }
+    int GetVerStride() const { return ver_stride_; }
 
     // 1. 初始化编码器 (设置宽高、像素格式、编码格式 H264/H265 等)
     bool Init(int width, int height, MppFrameFormat fmt, MppCodingType type);
@@ -60,7 +61,6 @@ private:
 
 private:
     struct EncoderExternalBuffer {
-        MppBuffer buffer;
         int fd;
         void* ptr;
         size_t size;
@@ -75,6 +75,9 @@ private:
     // 基础参数
     int width_;
     int height_;
+    int hor_stride_;
+    int ver_stride_;
+    size_t frame_size_;
     MppFrameFormat fmt_;
     
     // C++ 线程管理
@@ -85,8 +88,7 @@ private:
     // 回调函数
     PacketCallback on_packet_ready_;
 
-    // Buffer 管理：替代原先的 priv->list_buf
-    std::queue<MppBuffer> free_buffers_; 
+    // Buffer 管理：外部 DMA fd commit 到 MppBufferGroup，由 group 管空闲/占用
     std::deque<MppFrame> pending_frames_;
     std::vector<EncoderExternalBuffer> external_buffers_;
     std::mutex mtx_;

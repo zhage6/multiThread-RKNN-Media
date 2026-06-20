@@ -65,7 +65,7 @@ class VideoChannel
 
         //编码器特性
         RkMppEncoder* m_encoder; //编码器对象
-        std::unique_ptr<StreamPublisher> m_publisher;
+        std::unique_ptr<StreamPublisher> m_publisher; //推流器
         std::map<uint64_t, InferOutput> m_reorder_buffer; // 重排池
         uint64_t m_expected_frame_id;
         std::mutex m_reorder_mtx;

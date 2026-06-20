@@ -5,6 +5,9 @@
 #include <rockchip/mpp_debug.h>
 #include <rockchip/mpp_meta.h>
 #include <rockchip/rk_venc_cmd.h>
+
+#define MPP_ALIGN(x, a)         (((x) + (a) - 1) & ~((a) - 1))
+
 RkMppEncoder::RkMppEncoder() 
     : ctx_(nullptr), 
       mpi_(nullptr), 
@@ -13,6 +16,9 @@ RkMppEncoder::RkMppEncoder()
       is_running_(false),
       width_(0),
       height_(0),
+      hor_stride_(0),
+      ver_stride_(0),
+      frame_size_(0),
       fmt_(MPP_FMT_YUV420SP) 
       {}
 
@@ -24,22 +30,48 @@ bool RkMppEncoder::Init(int width, int height, MppFrameFormat fmt, MppCodingType
 {
     width_ = width;
     height_ = height;
+    hor_stride_ = MPP_ALIGN(width_, 16);
+    ver_stride_ = MPP_ALIGN(height_, 16);
     fmt_ = fmt;
+    frame_size_ = MPP_ALIGN(hor_stride_, 64) * MPP_ALIGN(ver_stride_, 64) * 3 / 2;
+
     MPP_RET ret = MPP_OK;
-    mpp_create(&ctx_, &mpi_);
-    mpp_init(ctx_, MPP_CTX_ENC, type);
+    ret = mpp_create(&ctx_, &mpi_);
+    if (ret != MPP_OK) {
+        printf("Encoder mpp_create 失败 ret=%d\n", ret);
+        Stop();
+        return false;
+    }
+
+    ret = mpp_init(ctx_, MPP_CTX_ENC, type);
+    if (ret != MPP_OK) {
+        printf("Encoder mpp_init 失败 ret=%d\n", ret);
+        Stop();
+        return false;
+    }
 
     // 2. 初始化 cfg 对象并获取硬件默认值
-    mpp_enc_cfg_init(&cfg_);
-    mpi_->control(ctx_, MPP_ENC_GET_CFG, cfg_);
+    ret = mpp_enc_cfg_init(&cfg_);
+    if (ret != MPP_OK) {
+        printf("Encoder cfg init 失败 ret=%d\n", ret);
+        Stop();
+        return false;
+    }
+
+    ret = mpi_->control(ctx_, MPP_ENC_GET_CFG, cfg_);
+    if (ret != MPP_OK) {
+        printf("Encoder get cfg 失败 ret=%d\n", ret);
+        Stop();
+        return false;
+    }
 
     // 3. 手动设置你需要的编码参数 (字典式键值对设置)
     
     // --- 准备阶段配置 (输入图像信息) ---
     mpp_enc_cfg_set_s32(cfg_, "prep:width", width);
     mpp_enc_cfg_set_s32(cfg_, "prep:height", height);
-    mpp_enc_cfg_set_s32(cfg_, "prep:hor_stride", width); // 通常水平步长等于宽度，若是按16或64对齐请按需修改
-    mpp_enc_cfg_set_s32(cfg_, "prep:ver_stride", height);
+    mpp_enc_cfg_set_s32(cfg_, "prep:hor_stride", hor_stride_);
+    mpp_enc_cfg_set_s32(cfg_, "prep:ver_stride", ver_stride_);
     mpp_enc_cfg_set_s32(cfg_, "prep:format", fmt);
 
     // --- 码率控制配置 (RC: Rate Control) ---
@@ -71,21 +103,26 @@ bool RkMppEncoder::Init(int width, int height, MppFrameFormat fmt, MppCodingType
     // 4. 【最关键的一步】将配置好的 cfg 下发给硬件！
     ret = mpi_->control(ctx_, MPP_ENC_SET_CFG, cfg_);
     if (ret != MPP_OK) {
-        // 处理配置下发失败的情况
+        printf("Encoder set cfg 失败 ret=%d\n", ret);
+        Stop();
         return false;
     }
 
     MppEncHeaderMode header_mode = MPP_ENC_HEADER_MODE_EACH_IDR;
-    mpi_->control(ctx_, MPP_ENC_SET_HEADER_MODE, &header_mode);
-
-    size_t frame_size = width_ * height_ * 1.5; // NV12 格式大小
-    if (!AllocateExternalBuffers(frame_size, 12)) {
-        ReleaseExternalBuffers();
-        
+    ret = mpi_->control(ctx_, MPP_ENC_SET_HEADER_MODE, &header_mode);
+    if (ret != MPP_OK) {
+        printf("Encoder set header mode 失败 ret=%d\n", ret);
+        Stop();
         return false;
     }
 
-    printf("Encoder Init Success. Width: %d, Height: %d", width_, height_);
+    if (!AllocateExternalBuffers(frame_size_, 12)) {
+        Stop();
+        return false;
+    }
+
+    printf("Encoder Init Success. Width: %d, Height: %d, Stride: %d x %d\n",
+           width_, height_, hor_stride_, ver_stride_);
     return true;
 }
 
@@ -109,7 +146,8 @@ bool RkMppEncoder::Start()
 
 bool RkMppEncoder::PushBuffer(MppBuffer buffer) 
 {
-    if (buffer == nullptr) {
+    if (buffer == nullptr) 
+    {
         return false;
     }
 
@@ -122,8 +160,8 @@ bool RkMppEncoder::PushBuffer(MppBuffer buffer)
     // 设置常规参数
     mpp_frame_set_width(frame, width_);
     mpp_frame_set_height(frame, height_);
-    mpp_frame_set_hor_stride(frame, width_);
-    mpp_frame_set_ver_stride(frame, height_);
+    mpp_frame_set_hor_stride(frame, hor_stride_);
+    mpp_frame_set_ver_stride(frame, ver_stride_);
     mpp_frame_set_fmt(frame, fmt_); // 如 MPP_FMT_YUV420SP
     
     // 绑定已经带有画框数据的物理内存
@@ -155,7 +193,6 @@ void RkMppEncoder::OutputThreadFunc()
     {
         // 尝试从硬件获取码流包
         MPP_RET ret = mpi_->encode_get_packet(ctx_, &packet);
-        
         if (ret == MPP_OK && packet != nullptr) 
         {
             // 1. 提取数据并触发回调
@@ -172,20 +209,14 @@ void RkMppEncoder::OutputThreadFunc()
                 on_packet_ready_((const uint8_t*)data, size, is_keyframe);
            }
 
-            MppMeta meta = mpp_packet_get_meta(packet);
-            MppFrame orig_frame = nullptr;
-            bool frame_recycled = false;
-            if (meta && MPP_OK == mpp_meta_get_frame(meta, KEY_INPUT_FRAME, &orig_frame) && orig_frame) {
-                RemovePendingFrame(orig_frame);
-                RecycleEncodedFrame(orig_frame);
-                frame_recycled = true;
+            bool frame_done = true;
+            if (mpp_packet_is_partition(packet)) {
+                frame_done = mpp_packet_is_eoi(packet);
             }
 
-            if (!frame_recycled) {
-                frame_recycled = RecycleOldestPendingFrame();
-                if (!frame_recycled) {
-                    printf("警告：编码输出 packet 没有找到可回收的输入帧。\n");
-                }
+            bool is_extra = (flags & MPP_PACKET_FLAG_EXTRA_DATA) ? true : false;
+            if (frame_done && !is_extra && !RecycleOldestPendingFrame()) {
+                printf("警告：编码输出 packet 没有找到可回收的输入帧。\n");
             }
 
             // 销毁包描述符
@@ -238,7 +269,7 @@ void RkMppEncoder::RecycleBuffer(MppBuffer buffer)
 
     {
         std::lock_guard<std::mutex> lock(mtx_);
-        free_buffers_.push(buffer);
+        mpp_buffer_put(buffer);
     }
     cv_.notify_one();
 }
@@ -250,26 +281,16 @@ void RkMppEncoder::RecycleEncodedFrame(MppFrame frame)
     }
 
     MppBuffer used_buffer = mpp_frame_get_buffer(frame);
-    RecycleBuffer(used_buffer);
     mpp_frame_deinit(&frame);
+    RecycleBuffer(used_buffer);
 }
 
 void RkMppEncoder::RemovePendingFrame(MppFrame frame)
 {
-    MppBuffer target_buffer = frame ? mpp_frame_get_buffer(frame) : nullptr;
-
     std::lock_guard<std::mutex> lock(mtx_);
     for (auto it = pending_frames_.begin(); it != pending_frames_.end(); ++it) {
-        MppFrame pending_frame = *it;
-        if (pending_frame == frame) {
+        if (*it == frame) {
             pending_frames_.erase(it);
-            return;
-        }
-
-        if (target_buffer && pending_frame &&
-            mpp_frame_get_buffer(pending_frame) == target_buffer) {
-            pending_frames_.erase(it);
-            mpp_frame_deinit(&pending_frame);
             return;
         }
     }
@@ -295,8 +316,6 @@ bool RkMppEncoder::RecycleOldestPendingFrame()
 
 void RkMppEncoder::Stop() 
 {
-    if (!is_running_) return;
-    
     // 1. 通知各线程退出
     is_running_ = false;
     cv_.notify_all(); // 唤醒可能卡在 PushFrame 等盘子的线程
@@ -311,28 +330,23 @@ void RkMppEncoder::Stop()
         output_thread_.join();
     }
 
-    // 4. 清理空闲队列引用，真实 buffer 由 external_buffers_ 统一释放
+    // 4. 清理还在编码器内部排队的输入帧，并把 group 里取出的 buffer 归还
     {
         std::lock_guard<std::mutex> lock(mtx_);
         for (auto frame : pending_frames_) {
             if (frame) {
+                MppBuffer buffer = mpp_frame_get_buffer(frame);
                 mpp_frame_deinit(&frame);
+                if (buffer) {
+                    mpp_buffer_put(buffer);
+                }
             }
         }
         pending_frames_.clear();
-
-        while (!free_buffers_.empty()) {
-            free_buffers_.pop();
-        }
     }
     ReleaseExternalBuffers();
 
     // 5. 销毁 MPP 各种句柄
-    if (buf_grp_) {
-        mpp_buffer_group_put(buf_grp_);
-        buf_grp_ = nullptr;
-    }
-
     if (cfg_) {
         mpp_enc_cfg_deinit(cfg_);
         cfg_ = nullptr;
@@ -350,25 +364,32 @@ void RkMppEncoder::Stop()
 MppBuffer RkMppEncoder::GetFreeBuffer() 
 {
     std::unique_lock<std::mutex> lock(mtx_);
-    while (free_buffers_.empty() && is_running_) {
+
+    while (is_running_) {
+        MppBuffer buffer = nullptr;
+        MPP_RET ret = mpp_buffer_get(buf_grp_, &buffer, frame_size_);
+        if (ret == MPP_OK && buffer != nullptr) {
+            return buffer;
+        }
+
         if (cv_.wait_for(lock, std::chrono::seconds(2)) == std::cv_status::timeout) {
-            printf("警告：编码器正在等待空闲输入 buffer，pending_frames=%zu。\n",
-                   pending_frames_.size());
+            printf("警告：编码器正在等待 MPP group 空闲输入 buffer，pending_frames=%zu ret=%d。\n",
+                   pending_frames_.size(), ret);
         }
     }
 
-    if (!is_running_ || free_buffers_.empty()) {
-        return nullptr;
-    }
-
-    MppBuffer buffer = free_buffers_.front();
-    free_buffers_.pop();
-    return buffer;
+    return nullptr;
 }
 
 bool RkMppEncoder::AllocateExternalBuffers(size_t frame_size, int count)
 {
     std::lock_guard<std::mutex> lock(mtx_);
+
+    MPP_RET ret = mpp_buffer_group_get_external(&buf_grp_, MPP_BUFFER_TYPE_DMA_HEAP);
+    if (ret != MPP_OK || buf_grp_ == nullptr) {
+        printf("Encoder 创建外部 MPP buffer group 失败 ret=%d\n", ret);
+        return false;
+    }
 
     for (int i = 0; i < count; ++i) {
         EncoderExternalBuffer ext_buf;
@@ -376,7 +397,8 @@ bool RkMppEncoder::AllocateExternalBuffers(size_t frame_size, int count)
         ext_buf.fd = -1;
         ext_buf.size = frame_size;
 
-        if (dma_buf_alloc(DMA_HEAP_DMA32_UNCACHED_PATH, frame_size, &ext_buf.fd, &ext_buf.ptr) < 0) {
+        if (dma_buf_alloc(DMA_HEAP_DMA32_UNCACHED_PATH, frame_size, &ext_buf.fd, &ext_buf.ptr) < 0) 
+        {
             printf("Encoder DMA32 buffer 申请失败!\n");
             return false;
         }
@@ -388,27 +410,34 @@ bool RkMppEncoder::AllocateExternalBuffers(size_t frame_size, int count)
         info.fd = ext_buf.fd;
         info.ptr = ext_buf.ptr;
 
-        if (mpp_buffer_import(&ext_buf.buffer, &info) != MPP_OK) {
-            printf("Encoder DMA32 buffer import 到 MPP 失败!\n");
+        if (mpp_buffer_commit(buf_grp_, &info) != MPP_OK) 
+        {
+            printf("Encoder DMA32 buffer commit 到 MPP group 失败!\n");
             dma_buf_free(ext_buf.size, &ext_buf.fd, ext_buf.ptr);
             return false;
         }
 
-        free_buffers_.push(ext_buf.buffer);
         external_buffers_.push_back(ext_buf);
     }
 
-    printf("Encoder 已分配 %d 块 DMA32 输入 buffer。\n", count);
+    ret = mpp_buffer_group_limit_config(buf_grp_, frame_size, count);
+    if (ret != MPP_OK) {
+        printf("Encoder MPP buffer group limit 配置失败 ret=%d\n", ret);
+        return false;
+    }
+
+    printf("Encoder 已分配并 commit %d 块 DMA32 输入 buffer。\n", count);
     return true;
 }
 
 void RkMppEncoder::ReleaseExternalBuffers()
 {
+    if (buf_grp_) {
+        mpp_buffer_group_put(buf_grp_);
+        buf_grp_ = nullptr;
+    }
+
     for (auto& ext_buf : external_buffers_) {
-        if (ext_buf.buffer) {
-            mpp_buffer_put(ext_buf.buffer);
-            ext_buf.buffer = nullptr;
-        }
         if (ext_buf.fd >= 0) {
             dma_buf_free(ext_buf.size, &ext_buf.fd, ext_buf.ptr);
             ext_buf.ptr = nullptr;

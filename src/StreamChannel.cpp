@@ -3,30 +3,30 @@
 #include <algorithm>
 #include <chrono>
 
-namespace {
-
-void release_source_buffer(const InferOutput& out)
+namespace 
 {
-    if (out.src_buffer) {
-        mpp_buffer_put(out.src_buffer);
+    void release_source_buffer(const InferOutput& out)
+    {
+        if (out.src_buffer) 
+        {
+            mpp_buffer_put(out.src_buffer);
+        }
     }
-}
 
-int clamp_to_range(int value, int low, int high)
-{
-    return std::max(low, std::min(value, high));
-}
+    int clamp_to_range(int value, int low, int high)
+    {
+        return std::max(low, std::min(value, high));
+    }
 
-int align_down_even(int value)
-{
-    return value & ~1;
-}
+    int align_down_even(int value)
+    {
+        return value & ~1;
+    }
 
-int align_up_even(int value)
-{
-    return (value + 1) & ~1;
-}
-
+    int align_up_even(int value)
+    {
+        return (value + 1) & ~1;
+    }
 } // namespace
 
 VideoChannel::VideoChannel(int channel_id, const std::string& stream_url, 
@@ -82,7 +82,7 @@ void VideoChannel::start()
             data.src_buffer = mpp_frame_get_buffer(frame);
             if (data.src_buffer) 
             {
-                mpp_buffer_inc_ref(data.src_buffer);
+                mpp_buffer_inc_ref(data.src_buffer); //后面的fd还需要继续的进行RGA，暂时不要释放
             }
             data.width = w;
             data.height = h;
@@ -107,7 +107,8 @@ void VideoChannel::start()
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
 
-            if (!m_running) {
+            if (!m_running) 
+            {
                 if (data.frame) {
                     mpp_frame_deinit(&data.frame);
                     data.frame = nullptr;
@@ -128,7 +129,7 @@ void VideoChannel::start()
         }, 
         MPP_VIDEO_CodingAVC    
         );
-        m_output_thread = std::thread(&VideoChannel::OutputLoop, this);
+        m_output_thread = std::thread(&VideoChannel::OutputLoop, this); //开启两个关键线程，一个是输出线程一个是解码线程
         m_decode_thread = std::thread(&VideoChannel::DecodeLoop, this);
 }
 void VideoChannel::Stop() 
@@ -155,8 +156,9 @@ void VideoChannel::OnInferOutput(const InferOutput& out)
                m_channel_id,
                static_cast<unsigned long long>(out.frame_id));
 
-        if (out.src_buffer) {
-            mpp_buffer_put(out.src_buffer);
+        if (out.src_buffer) 
+        {
+            mpp_buffer_put(out.src_buffer);//到这里才解码后第一帧的内存
         }
     }
 }
@@ -164,7 +166,8 @@ void VideoChannel::OnInferOutput(const InferOutput& out)
 void VideoChannel::OutputLoop()
 {
     InferOutput out;
-    while (m_output_queue.pop(out)) {
+    while (m_output_queue.pop(out)) 
+    {
         ProcessInferOutput(out);
     }
 }
@@ -190,10 +193,12 @@ void VideoChannel::ProcessInferOutput(const InferOutput& out)
     }
 
     auto old = m_reorder_buffer.find(out.frame_id);
-    if (old != m_reorder_buffer.end()) {
+    if (old != m_reorder_buffer.end()) 
+    {
         release_source_buffer(old->second);
         old->second = out;
-    } else 
+    } 
+    else 
     {
         m_reorder_buffer[out.frame_id] = out;
     }
@@ -258,7 +263,8 @@ void VideoChannel::ProcessInferOutput(const InferOutput& out)
         break;
     }
 
-    if (m_reorder_buffer.size() > 20) {
+    if (m_reorder_buffer.size() > 20) 
+    {
         uint64_t new_expected = m_reorder_buffer.begin()->first;
 
         timing::Log("reorder_overflow ch=%d size=%zu old_expected=%llu new_expected=%llu",
@@ -289,7 +295,7 @@ void VideoChannel::DecodeLoop()
     {
         while (m_running)
         {
-            int max_inflight = m_encoder_ready.load()
+            int max_inflight = m_encoder_ready.load()//如果编码器还没开始，即消费者还没启动，那么让该线程睡。少读取数据
                 ? m_max_inflight_frames
                 : m_startup_max_inflight_frames;
 
@@ -301,13 +307,14 @@ void VideoChannel::DecodeLoop()
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
 
-        while (m_pool->get_task_size() >= 40) //临时控速
+        while (m_pool->get_task_size() >= 40) //临时控速 //这个是推理池子
         {
         // 如果池子满了，强行让当前读取线程睡 5 毫秒
         // 这样就不会继续往外吐 frame，MPP 解码器也就停下来了，内存涨幅瞬间停止！
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-        if (!m_running) {
+        if (!m_running) 
+        {
             break;
         }
         size_t bytes_read = fread(buffer, 1, sizeof(buffer), fp);
@@ -413,18 +420,19 @@ void VideoChannel::EncodeZeroCopy(const InferOutput& out)
         return;
     }
 
-    int dst_fd = mpp_buffer_get_fd(mpp_buf);
+    int dst_fd = mpp_buffer_get_fd(mpp_buf); // 编码器输入 buffer，由 RGA 从解码 buffer 拷贝过来
     rga_buffer_t src_img = wrapbuffer_fd(out.src_fd, out.width, out.height,
                                          RK_FORMAT_YCbCr_420_SP,
                                          out.hor_stride, out.ver_stride);
     rga_buffer_t dst_img = wrapbuffer_fd(dst_fd, out.width, out.height,
                                          RK_FORMAT_YCbCr_420_SP,
-                                         out.width, out.height);
+                                         m_encoder->GetHorStride(), m_encoder->GetVerStride());
 
     auto copy_start = timing::Clock::now();
     IM_STATUS status = imcopy(src_img, dst_img);
     auto copy_end = timing::Clock::now();
-    if (status != IM_STATUS_SUCCESS) {
+    if (status != IM_STATUS_SUCCESS) 
+    {
         printf("RGA 编码前拷贝失败: %s\n", imStrError(status));
         timing::Log("encode_input_drop ch=%d frame=%llu reason=rga_copy_failed buffer_wait_us=%lld rga_copy_us=%lld",
                     m_channel_id,
@@ -435,7 +443,7 @@ void VideoChannel::EncodeZeroCopy(const InferOutput& out)
         release_source_buffer(out);
         return;
     }
-
+    //利用RGA在结果上帮忙画图
     int drawn_boxes = 0;
     auto draw_start = timing::Clock::now();
     for (int i = 0; i < out.results.count; ++i) {
