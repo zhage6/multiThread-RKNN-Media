@@ -98,7 +98,7 @@ int MppDecoder::AllocateExternalBuffers(size_t buf_size, int width, int height)
     if (ret != MPP_OK) return -1;
 
     // 2. 主控循环：自己去 Linux 系统申请 24 把物理内存钥匙
-    for (int i = 0; i < 24; i++) {
+    for (int i = 0; i < 16; i++) {
         ExternalBuffer ext_buf;
         memset(&ext_buf, 0, sizeof(ExternalBuffer));
         ext_buf.buf_size = buf_size;

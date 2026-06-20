@@ -28,7 +28,7 @@ public:
     int GetVerStride() const { return ver_stride_; }
 
     // 1. 初始化编码器 (设置宽高、像素格式、编码格式 H264/H265 等)
-    bool Init(int width, int height, MppFrameFormat fmt, MppCodingType type);
+    bool Init(int width, int height,int hor_stride, int ver_stride, MppFrameFormat fmt, MppCodingType type);
 
     // 2. 注册输出回调，硬件编码完成后会触发这个函数
     void SetOutputCallback(PacketCallback cb);

@@ -46,7 +46,7 @@ class VideoChannel
 
     private: 
         void DecodeLoop();
-        void InitEncoder(int width,int height,MppFrameFormat fmt);
+        void InitEncoder(int width, int height, int h_stride, int v_stride, MppFrameFormat fmt);
         void ProcessInferOutput(const InferOutput& out);
         void OutputLoop();
         void EncodeZeroCopy(const InferOutput& out);

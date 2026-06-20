@@ -87,7 +87,7 @@ void VideoChannel::start()
 
             if (m_encoder == nullptr) 
             {
-                InitEncoder(w, h, MPP_FMT_YUV420SP);
+                InitEncoder(w, h, h_stride, v_stride, MPP_FMT_YUV420SP);
             }
             data.width = w;
             data.height = h;
@@ -329,10 +329,10 @@ void VideoChannel::DecodeLoop()
     printf("通道 %d 解码线程结束。\n", m_channel_id);
     m_active_count--;
 }
-void VideoChannel::InitEncoder(int width,int height,MppFrameFormat fmt)
+void VideoChannel::InitEncoder(int width, int height, int h_stride, int v_stride, MppFrameFormat fmt)
 {
     m_encoder = new RkMppEncoder();
-    m_encoder->Init(width, height, fmt, MPP_VIDEO_CodingAVC);
+    m_encoder->Init(width, height, h_stride, v_stride, fmt, MPP_VIDEO_CodingAVC);
     m_stream_start_time = std::chrono::steady_clock::now();
     std::vector<uint8_t> h264_header;
     if (!m_encoder->GetHeader(h264_header)) 
@@ -399,51 +399,20 @@ void VideoChannel::InitEncoder(int width,int height,MppFrameFormat fmt)
 
 void VideoChannel::EncodeZeroCopy(const InferOutput& out) 
 {
+    IM_STATUS status;
     auto total_start = timing::Clock::now();
-    if (out.src_buffer == nullptr || out.src_fd < 0) {
+    if (out.src_buffer == nullptr || out.src_fd < 0) 
+    {
         timing::Log("encode_input_drop ch=%d frame=%llu reason=bad_src",
                     m_channel_id,
                     static_cast<unsigned long long>(out.frame_id));
         release_source_buffer(out);
         return;
     }
+    rga_buffer_t img = wrapbuffer_fd(out.src_fd, out.width, out.height,
+                                 RK_FORMAT_YCbCr_420_SP,
+                                 out.hor_stride, out.ver_stride);
 
-    auto get_buffer_start = timing::Clock::now();
-    MppBuffer mpp_buf = m_encoder->GetFreeBuffer();
-    auto get_buffer_end = timing::Clock::now();
-    if (mpp_buf == nullptr) 
-    {
-        timing::Log("encode_input_drop ch=%d frame=%llu reason=no_encoder_buffer wait_us=%lld",
-                    m_channel_id,
-                    static_cast<unsigned long long>(out.frame_id),
-                    timing::UsBetween(get_buffer_start, get_buffer_end));
-        release_source_buffer(out);
-        return;
-    }
-
-    int dst_fd = mpp_buffer_get_fd(mpp_buf); // 编码器输入 buffer，由 RGA 从解码 buffer 拷贝过来
-    rga_buffer_t src_img = wrapbuffer_fd(out.src_fd, out.width, out.height,
-                                         RK_FORMAT_YCbCr_420_SP,
-                                         out.hor_stride, out.ver_stride);
-    rga_buffer_t dst_img = wrapbuffer_fd(dst_fd, out.width, out.height,
-                                         RK_FORMAT_YCbCr_420_SP,
-                                         m_encoder->GetHorStride(), m_encoder->GetVerStride());
-
-    auto copy_start = timing::Clock::now();
-    IM_STATUS status = imcopy(src_img, dst_img);
-    auto copy_end = timing::Clock::now();
-    if (status != IM_STATUS_SUCCESS) 
-    {
-        printf("RGA 编码前拷贝失败: %s\n", imStrError(status));
-        timing::Log("encode_input_drop ch=%d frame=%llu reason=rga_copy_failed buffer_wait_us=%lld rga_copy_us=%lld",
-                    m_channel_id,
-                    static_cast<unsigned long long>(out.frame_id),
-                    timing::UsBetween(get_buffer_start, get_buffer_end),
-                    timing::UsBetween(copy_start, copy_end));
-        m_encoder->RecycleBuffer(mpp_buf);
-        release_source_buffer(out);
-        return;
-    }
     //利用RGA在结果上帮忙画图
     int drawn_boxes = 0;
     auto draw_start = timing::Clock::now();
@@ -460,7 +429,7 @@ void VideoChannel::EncodeZeroCopy(const InferOutput& out)
         }
 
         im_rect rect = {left, top, rect_w, rect_h};
-        status = imrectangle(dst_img, rect, 0x0000ff00, 4);
+        status = imrectangle(img, rect, 0x0000ff00, 4);
         if (status != IM_STATUS_SUCCESS) {
             printf("RGA 画框失败: %s\n", imStrError(status));
         } else {
@@ -470,16 +439,18 @@ void VideoChannel::EncodeZeroCopy(const InferOutput& out)
     auto draw_end = timing::Clock::now();
 
     auto push_start = timing::Clock::now();
-    m_encoder->PushBuffer(mpp_buf);
+    if (!m_encoder->PushBuffer(out.src_buffer)) 
+    {
+        release_source_buffer(out);
+        return;
+    }
     auto push_end = timing::Clock::now();
-    release_source_buffer(out);
+    //release_source_buffer(out);
 
-    timing::Log("encode_input ch=%d frame=%llu boxes=%d buffer_wait_us=%lld rga_copy_us=%lld draw_us=%lld enc_put_us=%lld total_us=%lld",
+    timing::Log("encode_input ch=%d frame=%llu boxes=%d  draw_us=%lld enc_put_us=%lld total_us=%lld",
                 m_channel_id,
                 static_cast<unsigned long long>(out.frame_id),
                 drawn_boxes,
-                timing::UsBetween(get_buffer_start, get_buffer_end),
-                timing::UsBetween(copy_start, copy_end),
                 timing::UsBetween(draw_start, draw_end),
                 timing::UsBetween(push_start, push_end),
                 timing::UsBetween(total_start, timing::Clock::now()));

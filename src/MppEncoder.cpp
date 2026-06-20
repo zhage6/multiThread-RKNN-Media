@@ -26,12 +26,12 @@ RkMppEncoder::~RkMppEncoder()
 {
     Stop();
 }
-bool RkMppEncoder::Init(int width, int height, MppFrameFormat fmt, MppCodingType type)
+bool RkMppEncoder::Init(int width, int height,int hor_stride, int ver_stride, MppFrameFormat fmt, MppCodingType type)
 {
     width_ = width;
     height_ = height;
-    hor_stride_ = MPP_ALIGN(width_, 16);
-    ver_stride_ = MPP_ALIGN(height_, 16);
+    hor_stride_ = hor_stride;
+    ver_stride_ = ver_stride;
     fmt_ = fmt;
     frame_size_ = MPP_ALIGN(hor_stride_, 64) * MPP_ALIGN(ver_stride_, 64) * 3 / 2;
 
@@ -117,13 +117,13 @@ bool RkMppEncoder::Init(int width, int height, MppFrameFormat fmt, MppCodingType
         return false;
     }
 
-    if (!AllocateExternalBuffers(frame_size_, 12)) {
-        Stop();
-        return false;
-    }
+    // if (!AllocateExternalBuffers(frame_size_, 12)) {
+    //     Stop();
+    //     return false;
+    // }
 
-    printf("Encoder Init Success. Width: %d, Height: %d, Stride: %d x %d\n",
-           width_, height_, hor_stride_, ver_stride_);
+    // printf("Encoder Init Success. Width: %d, Height: %d, Stride: %d x %d\n",
+    //        width_, height_, hor_stride_, ver_stride_);
     return true;
 }
 
@@ -153,8 +153,9 @@ bool RkMppEncoder::PushBuffer(MppBuffer buffer)
     }
 
     MppFrame frame = nullptr;
-    if (mpp_frame_init(&frame) != MPP_OK || frame == nullptr) {
-        RecycleBuffer(buffer);
+    if (mpp_frame_init(&frame) != MPP_OK || frame == nullptr) 
+    {
+        //RecycleBuffer(buffer);
         return false;
     }
     
@@ -178,7 +179,7 @@ bool RkMppEncoder::PushBuffer(MppBuffer buffer)
         printf("送入编码器失败!\n");
         RemovePendingFrame(frame);
         mpp_frame_deinit(&frame);
-        RecycleBuffer(buffer);
+        //RecycleBuffer(buffer);
         return false;
     }
 
