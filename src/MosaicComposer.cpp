@@ -1,12 +1,14 @@
 #include "MosaicComposer.h"
 #include <cstdio>
 #include <cstring>
+#include "TimingLogger.h"
 #define MPP_ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 MosaicComposer::MosaicComposer()
     : out_width_(0),
       out_height_(0),
       fps_(24),
-      initialized_(false)
+      initialized_(false),
+      stats_last_(std::chrono::steady_clock::now())
 {
 }
 
@@ -70,6 +72,7 @@ bool MosaicComposer::Init(int out_width, int out_height, int fps)
     packet_counter_ = 0;
     last_packet_pts_ = -1;
     stream_start_time_ = std::chrono::steady_clock::now();
+    stats_last_ = stream_start_time_;
 
     encoder_->SetOutputCallback([this](const uint8_t* data, size_t size, bool is_keyframe) {
         if (!publisher_ || data == nullptr || size == 0) 
@@ -231,6 +234,7 @@ void MosaicComposer::Submit(const InferOutput& out)
     }
 
     std::lock_guard<std::mutex> lock(mtx_);
+    submit_count_[out.channel_id]++;
 
     if (!initialized_) {
         if (out.src_buffer) {
@@ -262,6 +266,7 @@ void MosaicComposer::Submit(const InferOutput& out)
     {
         ComposeLocked();
     }
+    MaybeLogStatsLocked("submit");
 }
 
 void MosaicComposer::ComposeLocked()
@@ -272,10 +277,12 @@ void MosaicComposer::ComposeLocked()
     if (ret != MPP_OK || dst_buffer == nullptr) 
     {
         printf("Mosaic output buffer busy, drop one mosaic frame ret=%d\n", ret);
+        mosaic_busy_drop_count_++;
 
         for (auto& input : latest_) {
             ReleaseInput(input);
         }
+        MaybeLogStatsLocked("mosaic_busy");
         return;
     }
 
@@ -345,9 +352,11 @@ void MosaicComposer::ComposeLocked()
 
         if (status != IM_STATUS_SUCCESS) {
             printf("Mosaic RGA failed ch=%d status=%d\n", i, status);
+            mosaic_rga_fail_count_++;
         }
 
     }
+    mosaic_compose_count_++;
 
     printf("Mosaic compose success: ch0=%llu ch1=%llu ch2=%llu ch3=%llu\n",
            static_cast<unsigned long long>(latest_[0].frame_id),
@@ -372,4 +381,42 @@ void MosaicComposer::ComposeLocked()
             fps_,
             mosaic_push_count_ * 1.0 / fps_);
     }
+    MaybeLogStatsLocked("compose");
+}
+
+void MosaicComposer::MaybeLogStatsLocked(const char* source)
+{
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - stats_last_).count();
+    if (elapsed_ms < 1000) {
+        return;
+    }
+
+    uint64_t submit_total = 0;
+    for (uint64_t count : submit_count_) {
+        submit_total += count;
+    }
+
+    double seconds = elapsed_ms / 1000.0;
+    timing::Log("mosaic_health source=%s submit_fps=%.2f compose_fps=%.2f push_fps=%.2f busy_drop_fps=%.2f total_submit=%llu total_compose=%llu total_push=%llu rga_fail=%llu latest=%llu,%llu,%llu,%llu",
+                source ? source : "unknown",
+                (submit_total - stats_last_submit_total_) / seconds,
+                (mosaic_compose_count_ - stats_last_compose_count_) / seconds,
+                (mosaic_push_count_ - stats_last_push_count_) / seconds,
+                (mosaic_busy_drop_count_ - stats_last_busy_drop_count_) / seconds,
+                static_cast<unsigned long long>(submit_total),
+                static_cast<unsigned long long>(mosaic_compose_count_),
+                static_cast<unsigned long long>(mosaic_push_count_),
+                static_cast<unsigned long long>(mosaic_rga_fail_count_),
+                static_cast<unsigned long long>(latest_[0].frame_id),
+                static_cast<unsigned long long>(latest_[1].frame_id),
+                static_cast<unsigned long long>(latest_[2].frame_id),
+                static_cast<unsigned long long>(latest_[3].frame_id));
+
+    stats_last_ = now;
+    stats_last_submit_total_ = submit_total;
+    stats_last_compose_count_ = mosaic_compose_count_;
+    stats_last_push_count_ = mosaic_push_count_;
+    stats_last_busy_drop_count_ = mosaic_busy_drop_count_;
 }

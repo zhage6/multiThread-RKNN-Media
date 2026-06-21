@@ -4,6 +4,9 @@
 #include <array>
 #include <mutex>
 #include <cstdint>
+#include <memory>
+#include <chrono>
+#include <algorithm>
 #include <rockchip/mpp_buffer.h>
 #include "rkYolov5s.hpp"
 #include <vector>
@@ -53,6 +56,7 @@ private:
     void ReleaseInput(MosaicInput& input);
     bool ReadyLocked() const;
     void ComposeLocked();
+    void MaybeLogStatsLocked(const char* source);
 
 private:
     static constexpr int kChannels = 4; //固定四路输入
@@ -76,6 +80,15 @@ private:
     int out_ver_stride_;
     size_t out_buf_size_;
     uint64_t mosaic_push_count_ = 0;
+    uint64_t mosaic_compose_count_ = 0;
+    uint64_t mosaic_busy_drop_count_ = 0;
+    uint64_t mosaic_rga_fail_count_ = 0;
+    uint64_t stats_last_submit_total_ = 0;
+    uint64_t stats_last_compose_count_ = 0;
+    uint64_t stats_last_push_count_ = 0;
+    uint64_t stats_last_busy_drop_count_ = 0;
+    std::array<uint64_t, kChannels> submit_count_ {};
+    std::chrono::steady_clock::time_point stats_last_;
 
     std::vector<MosaicDmaBuffer> output_buffers_;
     MppBufferGroup mosaic_grp_ = nullptr;

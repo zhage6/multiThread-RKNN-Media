@@ -11,6 +11,8 @@ extern "C" {
 #include <cstdio>
 #include <string>
 #include <cstring>
+#include <chrono>
+#include "TimingLogger.h"
 
 struct EncodedPacket 
 {
@@ -81,6 +83,12 @@ public:
         width_ = width;
         height_ = height;
         fps_ = fps;
+        stats_start_ = std::chrono::steady_clock::now();
+        stats_last_ = stats_start_;
+        first_packet_seen_ = false;
+        pushed_packets_ = 0;
+        stats_last_pushed_packets_ = 0;
+        max_write_ms_ = 0;
 
         avformat_network_init();
 
@@ -178,13 +186,54 @@ public:
             avpkt->flags |= AV_PKT_FLAG_KEY;
         }
 
+        auto write_start = std::chrono::steady_clock::now();
         ret = av_interleaved_write_frame(fmt_ctx_, avpkt);
+        auto write_end = std::chrono::steady_clock::now();
+        long long write_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            write_end - write_start).count();
 
         av_packet_free(&avpkt);
 
         if (ret < 0) {
             PrintAvError("av_interleaved_write_frame failed", ret);
             return false;
+        }
+
+        pushed_packets_++;
+        if (write_ms > max_write_ms_) {
+            max_write_ms_ = write_ms;
+        }
+
+        if (!first_packet_seen_) {
+            first_packet_seen_ = true;
+            first_packet_wall_ = write_end;
+            first_packet_pts_ = packet.pts;
+        }
+
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            write_end - stats_last_).count();
+        if (elapsed_ms >= 1000) {
+            double seconds = elapsed_ms / 1000.0;
+            auto wall_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                write_end - first_packet_wall_).count();
+            long long media_elapsed_ms =
+                static_cast<long long>((packet.pts - first_packet_pts_) * 1000 / 90000);
+            long long media_wall_diff_ms = media_elapsed_ms - wall_elapsed_ms;
+
+            timing::Log("rtsp_health url=%s push_fps=%.2f write_ms_last=%lld write_ms_max=%lld media_wall_diff_ms=%lld total_packets=%llu pts=%lld size=%zu key=%d",
+                        url_.c_str(),
+                        (pushed_packets_ - stats_last_pushed_packets_) / seconds,
+                        write_ms,
+                        max_write_ms_,
+                        media_wall_diff_ms,
+                        static_cast<unsigned long long>(pushed_packets_),
+                        static_cast<long long>(packet.pts),
+                        packet.size,
+                        packet.keyframe ? 1 : 0);
+
+            stats_last_ = write_end;
+            stats_last_pushed_packets_ = pushed_packets_;
+            max_write_ms_ = 0;
         }
 
         return true;
@@ -222,6 +271,14 @@ private:
     int height_ = 0;
     int fps_ = 30;
     bool started_ = false;
+    bool first_packet_seen_ = false;
+    uint64_t pushed_packets_ = 0;
+    uint64_t stats_last_pushed_packets_ = 0;
+    long long max_write_ms_ = 0;
+    int64_t first_packet_pts_ = 0;
+    std::chrono::steady_clock::time_point stats_start_;
+    std::chrono::steady_clock::time_point stats_last_;
+    std::chrono::steady_clock::time_point first_packet_wall_;
 
     AVFormatContext* fmt_ctx_ = nullptr;
     AVStream* stream_ = nullptr;

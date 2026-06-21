@@ -5,6 +5,7 @@
 #include <rockchip/mpp_debug.h>
 #include <rockchip/mpp_meta.h>
 #include <rockchip/rk_venc_cmd.h>
+#include "TimingLogger.h"
 
 #define MPP_ALIGN(x, a)         (((x) + (a) - 1) & ~((a) - 1))
 
@@ -19,7 +20,16 @@ RkMppEncoder::RkMppEncoder()
       hor_stride_(0),
       ver_stride_(0),
       frame_size_(0),
-      fmt_(MPP_FMT_YUV420SP) 
+      fmt_(MPP_FMT_YUV420SP),
+      stats_last_(std::chrono::steady_clock::now()),
+      stats_last_in_(0),
+      stats_last_packet_(0),
+      stats_last_frame_(0),
+      stats_last_recycle_(0),
+      input_frame_count_(0),
+      output_packet_count_(0),
+      output_frame_count_(0),
+      recycled_frame_count_(0)
       {}
 
 RkMppEncoder::~RkMppEncoder() 
@@ -184,6 +194,8 @@ bool RkMppEncoder::PushBuffer(MppBuffer buffer)
     }
 
     // frame 等输出线程收到对应 packet 后再释放并回收 buffer。
+    input_frame_count_++;
+    MaybeLogStats("encoder_in");
     return true;
 }
 
@@ -205,8 +217,10 @@ void RkMppEncoder::OutputThreadFunc()
             uint32_t flags = mpp_packet_get_flag(packet);
             printf("\n>>> [输出线程] 收到硬件码流包! 长度: %zu 字节, flags: 0x%08x\n", size, flags);
             bool is_keyframe = (flags & MPP_PACKET_FLAG_INTRA) ? true : false;
+            bool is_extra = (flags & MPP_PACKET_FLAG_EXTRA_DATA) ? true : false;
+            output_packet_count_++;
             
-           if (size > 0 && on_packet_ready_) 
+           if (!is_extra && size > 0 && on_packet_ready_) 
            {
                 on_packet_ready_((const uint8_t*)data, size, is_keyframe);
            }
@@ -217,11 +231,15 @@ void RkMppEncoder::OutputThreadFunc()
                 frame_done = mpp_packet_is_eoi(packet);
             }
 
-            bool is_extra = (flags & MPP_PACKET_FLAG_EXTRA_DATA) ? true : false;
+            if (frame_done && !is_extra) {
+                output_frame_count_++;
+            }
+
             if (frame_done && !is_extra && !RecycleOldestPendingFrame()) 
             {
                 printf("警告：编码输出 packet 没有找到可回收的输入帧。\n");
             }
+            MaybeLogStats("encoder_out");
 
             // 销毁包描述符
             mpp_packet_deinit(&packet);
@@ -288,6 +306,47 @@ void RkMppEncoder::RecycleEncodedFrame(MppFrame frame)
     MppBuffer used_buffer = mpp_frame_get_buffer(frame);
     mpp_frame_deinit(&frame);
     RecycleBuffer(used_buffer);
+    recycled_frame_count_++;
+}
+
+void RkMppEncoder::MaybeLogStats(const char* source)
+{
+    std::lock_guard<std::mutex> stats_lock(stats_mtx_);
+
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - stats_last_).count();
+    if (elapsed_ms < 1000) {
+        return;
+    }
+
+    uint64_t in = input_frame_count_.load();
+    uint64_t packets = output_packet_count_.load();
+    uint64_t frames = output_frame_count_.load();
+    uint64_t recycled = recycled_frame_count_.load();
+
+    size_t pending = 0;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        pending = pending_frames_.size();
+    }
+
+    double seconds = elapsed_ms / 1000.0;
+    timing::Log("encoder_health source=%s in_fps=%.2f packet_fps=%.2f frame_fps=%.2f recycle_fps=%.2f pending=%zu total_in=%llu total_frames=%llu",
+                source ? source : "unknown",
+                (in - stats_last_in_) / seconds,
+                (packets - stats_last_packet_) / seconds,
+                (frames - stats_last_frame_) / seconds,
+                (recycled - stats_last_recycle_) / seconds,
+                pending,
+                static_cast<unsigned long long>(in),
+                static_cast<unsigned long long>(frames));
+
+    stats_last_ = now;
+    stats_last_in_ = in;
+    stats_last_packet_ = packets;
+    stats_last_frame_ = frames;
+    stats_last_recycle_ = recycled;
 }
 
 void RkMppEncoder::RemovePendingFrame(MppFrame frame)

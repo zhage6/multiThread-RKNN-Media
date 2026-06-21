@@ -7,6 +7,7 @@
 #include <functional>
 #include <vector>
 #include <atomic>
+#include <chrono>
 #include <rockchip/rk_mpi.h>
 #include <rockchip/mpp_frame.h>
 #include <rockchip/mpp_buffer.h>
@@ -61,6 +62,7 @@ private:
     void RecycleEncodedFrame(MppFrame frame);
     void RemovePendingFrame(MppFrame frame);
     bool RecycleOldestPendingFrame();
+    void MaybeLogStats(const char* source);
 
 private:
     struct EncoderExternalBuffer {
@@ -90,6 +92,17 @@ private:
 
     // 回调函数
     PacketCallback on_packet_ready_;
+
+    std::mutex stats_mtx_;
+    std::chrono::steady_clock::time_point stats_last_;
+    uint64_t stats_last_in_;
+    uint64_t stats_last_packet_;
+    uint64_t stats_last_frame_;
+    uint64_t stats_last_recycle_;
+    std::atomic<uint64_t> input_frame_count_;
+    std::atomic<uint64_t> output_packet_count_;
+    std::atomic<uint64_t> output_frame_count_;
+    std::atomic<uint64_t> recycled_frame_count_;
 
     // Buffer 管理：外部 DMA fd commit 到 MppBufferGroup，由 group 管空闲/占用
     std::deque<MppFrame> pending_frames_;

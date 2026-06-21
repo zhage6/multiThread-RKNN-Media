@@ -224,6 +224,7 @@ void VideoChannel::ProcessInferOutput(const InferOutput& out)
             //EncodeZeroCopy(current_out);
             if (m_mosaic) 
             {
+                m_encoder_ready = true;
                 m_mosaic->Submit(current_out);
             } 
             else 
