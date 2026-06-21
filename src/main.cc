@@ -41,7 +41,7 @@ int main(int argc, char **argv)
         return -1;
     }
     MosaicComposer mosaic;
-    mosaic.Init(1920, 1080, 24);
+    mosaic.Init(1920, 1080, 30);
     std::vector<std::shared_ptr<VideoChannel>> channels;
     channels.push_back(std::make_unique<VideoChannel>(0, "../test.h264", &testPool,active_channels, &mosaic));
     channels.push_back(std::make_unique<VideoChannel>(1, "../test2.h264", &testPool,active_channels, &mosaic));

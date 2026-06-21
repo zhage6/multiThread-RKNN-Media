@@ -364,4 +364,12 @@ void MosaicComposer::ComposeLocked()
         printf("Mosaic encoder push failed\n");
         mpp_buffer_put(dst_buffer);
     }
+    else
+    {
+        mosaic_push_count_++;
+        printf("Mosaic pushed=%llu duration@%dfps=%.2fs\n",
+            static_cast<unsigned long long>(mosaic_push_count_),
+            fps_,
+            mosaic_push_count_ * 1.0 / fps_);
+    }
 }

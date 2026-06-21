@@ -75,8 +75,8 @@ bool RkMppEncoder::Init(int width, int height,int hor_stride, int ver_stride, Mp
     mpp_enc_cfg_set_s32(cfg_, "prep:format", fmt);
 
     // --- 码率控制配置 (RC: Rate Control) ---
-    int fps_in = 24;
-    int fps_out = 24;
+    int fps_in = 30;
+    int fps_out = 30;
     int bps = width * height * fps_out * 0.1 *1; // 这是一个粗略的码率估算公式，可自定义
     
     // 设置 CBR (固定码率) 或 VBR (动态码率)

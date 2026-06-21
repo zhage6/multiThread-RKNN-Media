@@ -75,6 +75,7 @@ private:
     int out_hor_stride_;
     int out_ver_stride_;
     size_t out_buf_size_;
+    uint64_t mosaic_push_count_ = 0;
 
     std::vector<MosaicDmaBuffer> output_buffers_;
     MppBufferGroup mosaic_grp_ = nullptr;
