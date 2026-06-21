@@ -75,8 +75,8 @@ bool RkMppEncoder::Init(int width, int height,int hor_stride, int ver_stride, Mp
     mpp_enc_cfg_set_s32(cfg_, "prep:format", fmt);
 
     // --- 码率控制配置 (RC: Rate Control) ---
-    int fps_in = 30;
-    int fps_out = 30;
+    int fps_in = 24;
+    int fps_out = 24;
     int bps = width * height * fps_out * 0.1 *1; // 这是一个粗略的码率估算公式，可自定义
     
     // 设置 CBR (固定码率) 或 VBR (动态码率)
@@ -198,7 +198,7 @@ void RkMppEncoder::OutputThreadFunc()
         if (ret == MPP_OK && packet != nullptr) 
         {
             // 1. 提取数据并触发回调
-            void* data = mpp_packet_get_pos(packet);
+            void* data = mpp_packet_get_pos(packet);//获得数据指针
             size_t size = mpp_packet_get_length(packet);
             
             // 判断是否是 I 帧
@@ -212,12 +212,14 @@ void RkMppEncoder::OutputThreadFunc()
            }
 
             bool frame_done = true;
-            if (mpp_packet_is_partition(packet)) {
+            if (mpp_packet_is_partition(packet))
+            {
                 frame_done = mpp_packet_is_eoi(packet);
             }
 
             bool is_extra = (flags & MPP_PACKET_FLAG_EXTRA_DATA) ? true : false;
-            if (frame_done && !is_extra && !RecycleOldestPendingFrame()) {
+            if (frame_done && !is_extra && !RecycleOldestPendingFrame()) 
+            {
                 printf("警告：编码输出 packet 没有找到可回收的输入帧。\n");
             }
 
@@ -369,14 +371,17 @@ MppBuffer RkMppEncoder::GetFreeBuffer()
 {
     std::unique_lock<std::mutex> lock(mtx_);
 
-    while (is_running_) {
+    while (is_running_) 
+    {
         MppBuffer buffer = nullptr;
         MPP_RET ret = mpp_buffer_get(buf_grp_, &buffer, frame_size_);
-        if (ret == MPP_OK && buffer != nullptr) {
+        if (ret == MPP_OK && buffer != nullptr) 
+        {
             return buffer;
         }
 
-        if (cv_.wait_for(lock, std::chrono::seconds(2)) == std::cv_status::timeout) {
+        if (cv_.wait_for(lock, std::chrono::seconds(2)) == std::cv_status::timeout) 
+        {
             printf("警告：编码器正在等待 MPP group 空闲输入 buffer，pending_frames=%zu ret=%d。\n",
                    pending_frames_.size(), ret);
         }

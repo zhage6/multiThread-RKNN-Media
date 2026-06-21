@@ -10,6 +10,7 @@
 #include "rkYolov5s.hpp"
 #include "StreamPublisher.h"
 #include "ThreadSafeQueue.hpp"
+#include "MosaicComposer.h"
 
 
 struct DetectResult {
@@ -37,7 +38,7 @@ class VideoChannel
 {
     public:
         VideoChannel(int channel_id, const std::string& stream_url, 
-                    GlobalPool* pool,std::atomic<int>& active_cnt);
+                    GlobalPool* pool,std::atomic<int>& active_cnt, MosaicComposer* mosaic = nullptr);
         ~VideoChannel();
         void start();
         void Stop();
@@ -50,6 +51,8 @@ class VideoChannel
         void ProcessInferOutput(const InferOutput& out);
         void OutputLoop();
         void EncodeZeroCopy(const InferOutput& out);
+
+        MosaicComposer* m_mosaic;
 
 
         int m_channel_id; //通道id，区分不同输入源 

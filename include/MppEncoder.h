@@ -1,3 +1,5 @@
+#pragma once
+
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -19,7 +21,8 @@
 // is_keyframe: 是否是 I 帧 (方便上层做推流时的关键帧判断)
 using PacketCallback = std::function<void(const uint8_t* data, size_t size, bool is_keyframe)>;
 
-class RkMppEncoder {
+class RkMppEncoder 
+{
 public:
     RkMppEncoder();
     ~RkMppEncoder();

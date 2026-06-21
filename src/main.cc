@@ -11,6 +11,7 @@
 #include "postprocess.h"
 #include "MppDecoder.h"
 #include "StreamChannel.h"
+#include "MosaicComposer.h"
 namespace dpool 
 {
     constexpr size_t ThreadPool::WAIT_SECONDS;
@@ -30,7 +31,7 @@ int main(int argc, char **argv)
     // char *video_path = argv[2];
 
     // 初始化rknn线程池/Initialize the rknn thread pool
-    std::atomic<int> active_channels{2};
+    std::atomic<int> active_channels{4};
     int threadNum = 12;
     int in_flight_frames = 0;
     rknnPool<rkYolov5s, input_data, InferOutput> testPool(model_name, threadNum);
@@ -39,13 +40,15 @@ int main(int argc, char **argv)
         printf("rknnPool init fail!\n");
         return -1;
     }
+    MosaicComposer mosaic;
+    mosaic.Init(1920, 1080, 24);
     std::vector<std::shared_ptr<VideoChannel>> channels;
-    channels.push_back(std::make_unique<VideoChannel>(0, "../test.h264", &testPool,active_channels));
-    channels.push_back(std::make_unique<VideoChannel>(1, "../test2.h264", &testPool,active_channels));
-    channels.push_back(std::make_unique<VideoChannel>(2, "../test3.h264", &testPool,active_channels));
-    channels.push_back(std::make_unique<VideoChannel>(3, "../test4.h264", &testPool,active_channels));
-    channels.push_back(std::make_unique<VideoChannel>(4, "../test5.h264", &testPool,active_channels));
-    channels.push_back(std::make_unique<VideoChannel>(5, "../test6.h264", &testPool,active_channels));
+    channels.push_back(std::make_unique<VideoChannel>(0, "../test.h264", &testPool,active_channels, &mosaic));
+    channels.push_back(std::make_unique<VideoChannel>(1, "../test2.h264", &testPool,active_channels, &mosaic));
+    channels.push_back(std::make_unique<VideoChannel>(2, "../test3.h264", &testPool,active_channels, &mosaic));
+    channels.push_back(std::make_unique<VideoChannel>(3, "../test4.h264", &testPool,active_channels, &mosaic));
+//    channels.push_back(std::make_unique<VideoChannel>(4, "../test5.h264", &testPool,active_channels, &mosaic));
+//    channels.push_back(std::make_unique<VideoChannel>(5, "../test6.h264", &testPool,active_channels, &mosaic));
     
     
     

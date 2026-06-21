@@ -30,18 +30,19 @@ namespace
 } // namespace
 
 VideoChannel::VideoChannel(int channel_id, const std::string& stream_url, 
-                    GlobalPool* pool,std::atomic<int>& active_cnt)
+                    GlobalPool* pool,std::atomic<int>& active_cnt, MosaicComposer* mosaic)
         : m_channel_id(channel_id), 
           m_stream_url(stream_url), 
           m_pool(pool),
           m_running(false),
           m_frame_counter(0),
           m_active_count(active_cnt),
+          m_mosaic(mosaic),
           m_expected_frame_id(0), // 初始化期待的帧号
           m_encoder(nullptr),
           m_encode_packet_counter(0),
           m_last_packet_pts(-1),
-          m_output_fps(30),
+          m_output_fps(24),
           m_reorder_waiting(false),
           m_reorder_timeout(std::chrono::milliseconds(120)),
           m_reorder_drop_count(0),
@@ -85,10 +86,10 @@ void VideoChannel::start()
                 mpp_buffer_inc_ref(data.src_buffer); //后面的fd还需要继续的进行RGA，暂时不要释放
             }
 
-            if (m_encoder == nullptr) 
-            {
-                InitEncoder(w, h, h_stride, v_stride, MPP_FMT_YUV420SP);
-            }
+            // if (m_encoder == nullptr) 
+            // {
+            //     InitEncoder(w, h, h_stride, v_stride, MPP_FMT_YUV420SP);
+            // }
             data.width = w;
             data.height = h;
             data.hor_stride = h_stride;
@@ -220,7 +221,15 @@ void VideoChannel::ProcessInferOutput(const InferOutput& out)
                         m_reorder_buffer.size(),
                         static_cast<unsigned long long>(m_expected_frame_id));
 
-            EncodeZeroCopy(current_out);
+            //EncodeZeroCopy(current_out);
+            if (m_mosaic) 
+            {
+                m_mosaic->Submit(current_out);
+            } 
+            else 
+            {
+                EncodeZeroCopy(current_out);
+            }
             m_expected_frame_id++;
             continue;
         }
