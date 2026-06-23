@@ -3,6 +3,39 @@
 #include <cstring>
 #include "TimingLogger.h"
 #define MPP_ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
+namespace 
+{
+    void release_source_buffer(const InferOutput& out)
+    {
+        if (out.src_buffer) 
+        {
+            mpp_buffer_put(out.src_buffer);
+        }
+    }
+
+    int clamp_to_range(int value, int low, int high)
+    {
+        return std::max(low, std::min(value, high));
+    }
+
+    int align_down_even(int value)
+    {
+        return value & ~1;
+    }
+
+    int align_up_even(int value)
+    {
+        return (value + 1) & ~1;
+    }
+
+    bool is_local_stream_url(const std::string& url)
+    {
+        return url.rfind("rtsp://", 0) != 0 &&
+               url.rfind("rtmp://", 0) != 0 &&
+               url.rfind("http://", 0) != 0 &&
+               url.rfind("https://", 0) != 0;
+    }
+} // namespace
 MosaicComposer::MosaicComposer()
     : out_width_(0),
       out_height_(0),
@@ -402,10 +435,38 @@ void MosaicComposer::ComposeLocked()
                              dst_rect,
                              empty_rect,
                              IM_SYNC);
-
-        if (status != IM_STATUS_SUCCESS) {
+        
+        if (status != IM_STATUS_SUCCESS) 
+        {
             printf("Mosaic RGA failed ch=%d status=%d\n", i, status);
             mosaic_rga_fail_count_++;
+        }
+        float scale_x = static_cast<float>(dst_rect.width) / input.width;
+        float scale_y = static_cast<float>(dst_rect.height) / input.height;
+
+        for (int j = 0; j < input.results.count; ++j) 
+        {
+            const auto& res = input.results.results[j];
+
+            int left = dst_rect.x + align_down_even(clamp_to_range(
+                static_cast<int>(res.box.left * scale_x), 0, dst_rect.width - 2));
+
+            int top = dst_rect.y + align_down_even(clamp_to_range(
+                static_cast<int>(res.box.top * scale_y), 0, dst_rect.height - 2));
+
+            int right = dst_rect.x + align_up_even(clamp_to_range(
+                static_cast<int>(res.box.right * scale_x), left - dst_rect.x + 2, dst_rect.width));
+
+            int bottom = dst_rect.y + align_up_even(clamp_to_range(
+                static_cast<int>(res.box.bottom * scale_y), top - dst_rect.y + 2, dst_rect.height));
+
+            im_rect rect;
+            rect.x = left;
+            rect.y = top;
+            rect.width = right - left;
+            rect.height = bottom - top;
+
+            imrectangle(dst_img, rect, 0x0000ff00, 4);
         }
 
     }

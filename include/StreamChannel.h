@@ -77,6 +77,9 @@ class VideoChannel
         int64_t m_last_packet_pts;
         int m_output_fps;
         std::chrono::steady_clock::time_point m_stream_start_time;
+        std::chrono::steady_clock::time_point m_input_start_time;
+        bool m_throttle_local_input;
+        int m_input_fps;
 
 
         bool m_reorder_waiting;

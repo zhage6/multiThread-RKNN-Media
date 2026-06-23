@@ -27,6 +27,14 @@ namespace
     {
         return (value + 1) & ~1;
     }
+
+    bool is_local_stream_url(const std::string& url)
+    {
+        return url.rfind("rtsp://", 0) != 0 &&
+               url.rfind("rtmp://", 0) != 0 &&
+               url.rfind("http://", 0) != 0 &&
+               url.rfind("https://", 0) != 0;
+    }
 } // namespace
 
 VideoChannel::VideoChannel(int channel_id, const std::string& stream_url, 
@@ -43,6 +51,8 @@ VideoChannel::VideoChannel(int channel_id, const std::string& stream_url,
           m_encode_packet_counter(0),
           m_last_packet_pts(-1),
           m_output_fps(24),
+          m_throttle_local_input(is_local_stream_url(stream_url)),
+          m_input_fps(24),
           m_reorder_waiting(false),
           m_reorder_timeout(std::chrono::milliseconds(120)),
           m_reorder_drop_count(0),
@@ -76,6 +86,13 @@ void VideoChannel::start()
 {
     if(m_running) return;
         m_running = true;
+        m_input_start_time = std::chrono::steady_clock::now();
+        if (m_throttle_local_input) {
+            timing::Log("local_input_throttle_enabled ch=%d fps=%d url=%s",
+                        m_channel_id,
+                        m_input_fps,
+                        m_stream_url.c_str());
+        }
         m_decoder->Init([this](int src_fd, int w, int h, int h_stride, int v_stride, MppFrame frame) {
             // 当这个通道的 MPP 解出一帧时，会触发这里
             input_data data;
@@ -98,6 +115,22 @@ void VideoChannel::start()
             data.channel_id = this->m_channel_id;    // 贴上通道标签
             data.frame_id = this->m_frame_counter++; // 贴上序号标签(满了怎么办？)
             data.pts_us = -1;                        // 当前阶段没有真实 PTS，先保留字段
+
+            if (this->m_throttle_local_input && this->m_input_fps > 0) {
+                auto target_time = this->m_input_start_time +
+                    std::chrono::microseconds(data.frame_id * 1000000 / this->m_input_fps);
+
+                while (this->m_running) {
+                    auto now = std::chrono::steady_clock::now();
+                    if (now >= target_time) {
+                        break;
+                    }
+
+                    auto wake_time = std::min(target_time, now + std::chrono::milliseconds(5));
+                    std::this_thread::sleep_until(wake_time);
+                }
+            }
+
             // 塞入全局共享的 RKNN 线程池！
             // 注意：如果池子满了，你的 m_pool->put 会阻塞，这天然形成了对当前解码线程的“反压”
             printf("一帧解码完成\n");
