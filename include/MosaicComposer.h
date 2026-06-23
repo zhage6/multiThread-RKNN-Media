@@ -2,11 +2,14 @@
 #define MOSAIC_COMPOSER_H
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <cstdint>
 #include <memory>
 #include <chrono>
 #include <algorithm>
+#include <thread>
 #include <rockchip/mpp_buffer.h>
 #include "rkYolov5s.hpp"
 #include <vector>
@@ -23,6 +26,7 @@ struct MosaicInput
 
     int channel_id = -1;
     uint64_t frame_id = 0;
+    int64_t pts_us = -1;
 
     MppBuffer src_buffer = nullptr;
     int src_fd = -1;
@@ -55,6 +59,7 @@ public:
 private:
     void ReleaseInput(MosaicInput& input);
     bool ReadyLocked() const;
+    void FlowLoop();
     void ComposeLocked();
     void MaybeLogStatsLocked(const char* source);
 
@@ -80,15 +85,22 @@ private:
     int out_ver_stride_;
     size_t out_buf_size_;
     uint64_t mosaic_push_count_ = 0;
+    uint64_t mosaic_tick_count_ = 0;
+    uint64_t mosaic_not_ready_count_ = 0;
     uint64_t mosaic_compose_count_ = 0;
     uint64_t mosaic_busy_drop_count_ = 0;
     uint64_t mosaic_rga_fail_count_ = 0;
     uint64_t stats_last_submit_total_ = 0;
+    uint64_t stats_last_tick_count_ = 0;
+    uint64_t stats_last_not_ready_count_ = 0;
     uint64_t stats_last_compose_count_ = 0;
     uint64_t stats_last_push_count_ = 0;
     uint64_t stats_last_busy_drop_count_ = 0;
     std::array<uint64_t, kChannels> submit_count_ {};
     std::chrono::steady_clock::time_point stats_last_;
+    std::thread flow_thread_;
+    std::condition_variable flow_cv_;
+    bool flow_running_ = false;
 
     std::vector<MosaicDmaBuffer> output_buffers_;
     MppBufferGroup mosaic_grp_ = nullptr;

@@ -97,6 +97,7 @@ void VideoChannel::start()
             data.frame = frame;
             data.channel_id = this->m_channel_id;    // 贴上通道标签
             data.frame_id = this->m_frame_counter++; // 贴上序号标签(满了怎么办？)
+            data.pts_us = -1;                        // 当前阶段没有真实 PTS，先保留字段
             // 塞入全局共享的 RKNN 线程池！
             // 注意：如果池子满了，你的 m_pool->put 会阻塞，这天然形成了对当前解码线程的“反压”
             printf("一帧解码完成\n");

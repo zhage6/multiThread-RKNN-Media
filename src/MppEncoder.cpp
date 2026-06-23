@@ -243,36 +243,6 @@ void RkMppEncoder::OutputThreadFunc()
 
             // 销毁包描述符
             mpp_packet_deinit(&packet);
-            // if (flags & MPP_PACKET_FLAG_EXTRA_DATA) 
-            // {
-            //     // 这是配置参数头，不需要回收 Buffer
-            //     printf("收到 SPS/PPS 头信息包，正常放行。\n");
-            // } 
-            // else 
-            // {
-            //     // 正常的视频数据包，执行回收闭环
-            //     MppMeta meta = mpp_packet_get_meta(packet);
-            //     MppFrame orig_frame = nullptr;
-                
-            //     // 确保 meta 存在，且成功取到了输入帧
-            //     if (meta != nullptr && MPP_OK == mpp_meta_get_frame(meta, KEY_INPUT_FRAME, &orig_frame)) 
-            //     {
-            //         MppBuffer used_buffer = mpp_frame_get_buffer(orig_frame);
-                    
-            //         {
-            //             std::lock_guard<std::mutex> lock(mtx_);
-            //             free_buffers_.push(used_buffer);
-            //         }
-            //         cv_.notify_one(); 
-                    
-            //         // 🚨 真正的外壳销毁地点在这里！
-            //         mpp_frame_deinit(&orig_frame);
-            //     } 
-            //     else 
-            //     {
-            //         printf("警告：无法找到原始输入帧，可能导致内存泄漏！\n");
-            //     }
-            // }
         } 
         else 
         {

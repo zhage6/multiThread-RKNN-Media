@@ -71,6 +71,19 @@ bool MosaicComposer::Init(int out_width, int out_height, int fps)
 
     packet_counter_ = 0;
     last_packet_pts_ = -1;
+    mosaic_push_count_ = 0;
+    mosaic_tick_count_ = 0;
+    mosaic_not_ready_count_ = 0;
+    mosaic_compose_count_ = 0;
+    mosaic_busy_drop_count_ = 0;
+    mosaic_rga_fail_count_ = 0;
+    stats_last_submit_total_ = 0;
+    stats_last_tick_count_ = 0;
+    stats_last_not_ready_count_ = 0;
+    stats_last_compose_count_ = 0;
+    stats_last_push_count_ = 0;
+    stats_last_busy_drop_count_ = 0;
+    submit_count_.fill(0);
     stream_start_time_ = std::chrono::steady_clock::now();
     stats_last_ = stream_start_time_;
 
@@ -81,10 +94,6 @@ bool MosaicComposer::Init(int out_width, int out_height, int fps)
         }
         const int fps = std::max(1, fps_);
         const uint64_t frame_index = packet_counter_++;
-
-        auto target_time = stream_start_time_ +
-            std::chrono::microseconds(frame_index * 1000000 / fps);
-        std::this_thread::sleep_until(target_time);
 
         EncodedPacket packet;
         packet.channel_id = 0;
@@ -113,6 +122,9 @@ bool MosaicComposer::Init(int out_width, int out_height, int fps)
         initialized_ = false;
         return false;
     }
+
+    flow_running_ = true;
+    flow_thread_ = std::thread(&MosaicComposer::FlowLoop, this);
 
     return true;
 }
@@ -159,9 +171,18 @@ bool MosaicComposer::AllocateOutputBuffers(int count)
 
 void MosaicComposer::Stop()
 {
-    std::lock_guard<std::mutex> lock(mtx_);
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        initialized_ = false;
+        flow_running_ = false;
+    }
 
-    initialized_ = false;
+    flow_cv_.notify_all();
+    if (flow_thread_.joinable()) {
+        flow_thread_.join();
+    }
+
+    std::lock_guard<std::mutex> lock(mtx_);
 
     for (auto& input : latest_) {
         ReleaseInput(input);
@@ -208,6 +229,9 @@ void MosaicComposer::ReleaseInput(MosaicInput& input)
     }
 
     input.src_fd = -1;
+    input.channel_id = -1;
+    input.frame_id = 0;
+    input.pts_us = -1;
     input.valid = false;
 }
 
@@ -245,7 +269,7 @@ void MosaicComposer::Submit(const InferOutput& out)
 
     MosaicInput& slot = latest_[out.channel_id];
 
-    // 新帧覆盖旧帧时，旧帧还没拼接就要释放，避免 decoder buffer 泄漏。
+    // 新帧覆盖本通道 latest 时释放旧帧，避免 decoder buffer 泄漏。
     if (slot.valid) 
     {
         ReleaseInput(slot);
@@ -254,6 +278,7 @@ void MosaicComposer::Submit(const InferOutput& out)
     slot.valid = true;
     slot.channel_id = out.channel_id;
     slot.frame_id = out.frame_id;
+    slot.pts_us = out.pts_us;
     slot.src_buffer = out.src_buffer;
     slot.src_fd = out.src_fd;
     slot.width = out.width;
@@ -262,15 +287,49 @@ void MosaicComposer::Submit(const InferOutput& out)
     slot.ver_stride = out.ver_stride;
     slot.results = out.results;
 
-    if (ReadyLocked()) 
-    {
-        ComposeLocked();
-    }
     MaybeLogStatsLocked("submit");
+}
+
+void MosaicComposer::FlowLoop()
+{
+    const int fps = std::max(1, fps_);
+    const auto period = std::chrono::microseconds(1000000 / fps);
+    auto next_tick = std::chrono::steady_clock::now() + period;
+
+    while (true) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        if (flow_cv_.wait_until(lock, next_tick, [this]() { return !flow_running_; })) {
+            break;
+        }
+
+        if (!flow_running_) {
+            break;
+        }
+
+        mosaic_tick_count_++;
+        if (initialized_ && ReadyLocked()) {
+            ComposeLocked();
+        } else {
+            mosaic_not_ready_count_++;
+            MaybeLogStatsLocked("mosaic_not_ready");
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        next_tick += period;
+        if (next_tick <= now) {
+            next_tick = now + period;
+        }
+    }
 }
 
 void MosaicComposer::ComposeLocked()
 {
+    if (!ReadyLocked()) {
+        mosaic_not_ready_count_++;
+        MaybeLogStatsLocked("mosaic_not_ready");
+        return;
+    }
+
     MppBuffer dst_buffer = nullptr;
     MPP_RET ret = mpp_buffer_get(mosaic_grp_, &dst_buffer, out_buf_size_);
 
@@ -278,10 +337,6 @@ void MosaicComposer::ComposeLocked()
     {
         printf("Mosaic output buffer busy, drop one mosaic frame ret=%d\n", ret);
         mosaic_busy_drop_count_++;
-
-        for (auto& input : latest_) {
-            ReleaseInput(input);
-        }
         MaybeLogStatsLocked("mosaic_busy");
         return;
     }
@@ -292,10 +347,8 @@ void MosaicComposer::ComposeLocked()
     {
         printf("Mosaic mpp_buffer_info_get failed\n");
         mpp_buffer_put(dst_buffer);
-        for (auto& input : latest_) 
-        {
-            ReleaseInput(input);
-        }
+        mosaic_busy_drop_count_++;
+        MaybeLogStatsLocked("mosaic_bad_output_buffer");
         return;
     }
     int dst_fd = dst_info.fd;
@@ -364,10 +417,6 @@ void MosaicComposer::ComposeLocked()
            static_cast<unsigned long long>(latest_[2].frame_id),
            static_cast<unsigned long long>(latest_[3].frame_id));
 
-    for (auto& input : latest_) {
-        ReleaseInput(input);
-    }
-
    if (!encoder_ || !encoder_->PushBuffer(dst_buffer)) 
     {
         printf("Mosaic encoder push failed\n");
@@ -399,23 +448,33 @@ void MosaicComposer::MaybeLogStatsLocked(const char* source)
     }
 
     double seconds = elapsed_ms / 1000.0;
-    timing::Log("mosaic_health source=%s submit_fps=%.2f compose_fps=%.2f push_fps=%.2f busy_drop_fps=%.2f total_submit=%llu total_compose=%llu total_push=%llu rga_fail=%llu latest=%llu,%llu,%llu,%llu",
+    timing::Log("mosaic_health source=%s submit_fps=%.2f tick_fps=%.2f not_ready_fps=%.2f compose_fps=%.2f push_fps=%.2f busy_drop_fps=%.2f total_submit=%llu total_tick=%llu total_not_ready=%llu total_compose=%llu total_push=%llu rga_fail=%llu latest_frame=%llu,%llu,%llu,%llu latest_pts_us=%lld,%lld,%lld,%lld",
                 source ? source : "unknown",
                 (submit_total - stats_last_submit_total_) / seconds,
+                (mosaic_tick_count_ - stats_last_tick_count_) / seconds,
+                (mosaic_not_ready_count_ - stats_last_not_ready_count_) / seconds,
                 (mosaic_compose_count_ - stats_last_compose_count_) / seconds,
                 (mosaic_push_count_ - stats_last_push_count_) / seconds,
                 (mosaic_busy_drop_count_ - stats_last_busy_drop_count_) / seconds,
                 static_cast<unsigned long long>(submit_total),
+                static_cast<unsigned long long>(mosaic_tick_count_),
+                static_cast<unsigned long long>(mosaic_not_ready_count_),
                 static_cast<unsigned long long>(mosaic_compose_count_),
                 static_cast<unsigned long long>(mosaic_push_count_),
                 static_cast<unsigned long long>(mosaic_rga_fail_count_),
                 static_cast<unsigned long long>(latest_[0].frame_id),
                 static_cast<unsigned long long>(latest_[1].frame_id),
                 static_cast<unsigned long long>(latest_[2].frame_id),
-                static_cast<unsigned long long>(latest_[3].frame_id));
+                static_cast<unsigned long long>(latest_[3].frame_id),
+                static_cast<long long>(latest_[0].pts_us),
+                static_cast<long long>(latest_[1].pts_us),
+                static_cast<long long>(latest_[2].pts_us),
+                static_cast<long long>(latest_[3].pts_us));
 
     stats_last_ = now;
     stats_last_submit_total_ = submit_total;
+    stats_last_tick_count_ = mosaic_tick_count_;
+    stats_last_not_ready_count_ = mosaic_not_ready_count_;
     stats_last_compose_count_ = mosaic_compose_count_;
     stats_last_push_count_ = mosaic_push_count_;
     stats_last_busy_drop_count_ = mosaic_busy_drop_count_;

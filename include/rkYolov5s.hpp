@@ -23,6 +23,7 @@ struct input_data
     // ======== 多路框架新增 ========
     int channel_id;      // 标记是哪一路视频
     uint64_t frame_id;   // 标记这路视频的第几帧 (用来排序)
+    int64_t pts_us = -1; // 预留媒体时间戳，当前没有真实 PTS 时保持 -1
 
 };
 
@@ -31,6 +32,7 @@ struct InferOutput
     detect_result_group_t results; // 目标检测结果
     int channel_id;      // 标记是哪一路视频
     uint64_t frame_id;   // 标记这路视频的第几帧 (用来排序)
+    int64_t pts_us = -1; // 预留媒体时间戳，当前没有真实 PTS 时保持 -1
     MppBuffer src_buffer; // 原始解码 DMA buffer，编码前由 RGA 读取
     int src_fd;
     int width;
