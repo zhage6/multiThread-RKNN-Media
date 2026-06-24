@@ -19,6 +19,7 @@
 #include "RgaUtils.h"
 #include "MppEncoder.h"
 #include "StreamPublisher.h"
+#include "FrameTypes.h"
 
 struct MosaicInput 
 {
@@ -37,6 +38,7 @@ struct MosaicInput
     int ver_stride = 0;
 
     detect_result_group_t results;
+    std::vector<ModelResult> model_results;
 };
 
 struct MosaicDmaBuffer 
@@ -54,6 +56,7 @@ public:
 
     bool Init(int out_width, int out_height, int fps);
     void Submit(const InferOutput& out);
+    void Submit(const ComposedFrame& frame);// 新的submit为了多模型
     void Stop();
 
 private:

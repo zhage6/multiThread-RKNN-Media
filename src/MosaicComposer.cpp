@@ -35,6 +35,12 @@ namespace
                url.rfind("http://", 0) != 0 &&
                url.rfind("https://", 0) != 0;
     }
+    struct RenderStats 
+    {
+        int boxes = 0;
+        int unsupported = 0;
+        int failed = 0;
+    };
 } // namespace
 MosaicComposer::MosaicComposer()
     : out_width_(0),
@@ -266,6 +272,20 @@ void MosaicComposer::ReleaseInput(MosaicInput& input)
     input.frame_id = 0;
     input.pts_us = -1;
     input.valid = false;
+    if (input.src_buffer) 
+    {
+        mpp_buffer_put(input.src_buffer);
+        input.src_buffer = nullptr;
+    }
+
+    input.src_fd = -1;
+    input.channel_id = -1;
+    input.frame_id = 0;
+    input.pts_us = -1;
+    input.valid = false;
+
+    memset(&input.results, 0, sizeof(input.results));
+    input.model_results.clear();
 }
 
 bool MosaicComposer::ReadyLocked() const
@@ -279,49 +299,65 @@ bool MosaicComposer::ReadyLocked() const
     return true;
 }
 
+
+
 void MosaicComposer::Submit(const InferOutput& out)
 {
-    if (out.channel_id < 0 || out.channel_id >= kChannels) 
+    Submit(MakeYoloComposedFrame(out));
+}
+
+void MosaicComposer::Submit(const ComposedFrame& frame)
+{
+    const FrameContext& ctx = frame.frame;
+
+    if (ctx.channel_id < 0 || ctx.channel_id >= kChannels) 
     {
-        if (out.src_buffer) 
-        {
-            mpp_buffer_put(out.src_buffer);
+        if (ctx.src_buffer) {
+            mpp_buffer_put(ctx.src_buffer);
         }
         return;
     }
 
     std::lock_guard<std::mutex> lock(mtx_);
-    submit_count_[out.channel_id]++;
+    submit_count_[ctx.channel_id]++;
 
     if (!initialized_) {
-        if (out.src_buffer) {
-            mpp_buffer_put(out.src_buffer);
+        if (ctx.src_buffer) {
+            mpp_buffer_put(ctx.src_buffer);
         }
         return;
     }
 
-    MosaicInput& slot = latest_[out.channel_id];
+    MosaicInput& slot = latest_[ctx.channel_id];
 
-    // 新帧覆盖本通道 latest 时释放旧帧，避免 decoder buffer 泄漏。
-    if (slot.valid) 
-    {
+    if (slot.valid) {
         ReleaseInput(slot);
     }
 
     slot.valid = true;
-    slot.channel_id = out.channel_id;
-    slot.frame_id = out.frame_id;
-    slot.pts_us = out.pts_us;
-    slot.src_buffer = out.src_buffer;
-    slot.src_fd = out.src_fd;
-    slot.width = out.width;
-    slot.height = out.height;
-    slot.hor_stride = out.hor_stride;
-    slot.ver_stride = out.ver_stride;
-    slot.results = out.results;
+    slot.channel_id = ctx.channel_id;
+    slot.frame_id = ctx.frame_id;
+    slot.pts_us = ctx.pts_us;
+    slot.src_buffer = ctx.src_buffer;
+    slot.src_fd = ctx.src_fd;
+    slot.width = ctx.width;
+    slot.height = ctx.height;
+    slot.hor_stride = ctx.hor_stride;
+    slot.ver_stride = ctx.ver_stride;
+    slot.model_results = frame.results;
+
+    // 先兼容 YOLO：从 composed results 里找 Detection 结果
+    memset(&slot.results, 0, sizeof(slot.results));
+    for (const auto& result : frame.results) {
+        if (result.type == ModelResultType::Detection && result.ok) {
+            slot.results = result.detections;
+            break;
+        }
+    }
 
     MaybeLogStatsLocked("submit");
 }
+
 
 void MosaicComposer::FlowLoop()
 {
@@ -353,6 +389,78 @@ void MosaicComposer::FlowLoop()
             next_tick = now + period;
         }
     }
+}
+RenderStats RenderModelResult(const ModelResult& result,
+                       const MosaicInput& input,
+                       const im_rect& dst_rect,
+                       rga_buffer_t dst_img,
+                       int channel_index)
+{
+    RenderStats stats;
+    if (!result.ok) 
+    {
+        stats.failed++;
+        return stats;
+    }
+
+    switch (result.type) 
+    {
+    case ModelResultType::Detection:
+    {
+        const float scale_x = static_cast<float>(dst_rect.width) / input.width;
+        const float scale_y = static_cast<float>(dst_rect.height) / input.height;
+
+        const int cell_left = dst_rect.x;
+        const int cell_top = dst_rect.y;
+        const int cell_right = dst_rect.x + dst_rect.width;
+        const int cell_bottom = dst_rect.y + dst_rect.height;
+
+        for (int j = 0; j < result.detections.count; ++j) 
+        {
+            const auto& res = result.detections.results[j];
+
+            int src_left = clamp_to_range(res.box.left, 0, input.width - 2);
+            int src_top = clamp_to_range(res.box.top, 0, input.height - 2);
+            int src_right = clamp_to_range(res.box.right, src_left + 2, input.width);
+            int src_bottom = clamp_to_range(res.box.bottom, src_top + 2, input.height);
+
+            int left = cell_left + static_cast<int>(src_left * scale_x);
+            int top = cell_top + static_cast<int>(src_top * scale_y);
+            int right = cell_left + static_cast<int>(src_right * scale_x);
+            int bottom = cell_top + static_cast<int>(src_bottom * scale_y);
+
+            left = align_down_even(clamp_to_range(left, cell_left, cell_right - 2));
+            top = align_down_even(clamp_to_range(top, cell_top, cell_bottom - 2));
+            right = align_up_even(clamp_to_range(right, left + 2, cell_right));
+            bottom = align_up_even(clamp_to_range(bottom, top + 2, cell_bottom));
+
+            im_rect rect;
+            rect.x = left;
+            rect.y = top;
+            rect.width = right - left;
+            rect.height = bottom - top;
+
+            IM_STATUS rect_status = imrectangle(dst_img, rect, 0x0000ff00, 4);
+            if (rect_status != IM_STATUS_SUCCESS) 
+            {
+                printf("Mosaic draw box failed ch=%d box=%d status=%d\n",
+                       channel_index, j, rect_status);
+            }
+        }
+        stats.boxes++;
+        break;
+    }
+
+    case ModelResultType::Classification:
+    case ModelResultType::Segmentation:
+    case ModelResultType::Keypoints:
+    case ModelResultType::Custom:
+    default:
+        // 第一阶段先不渲染这些类型，避免阻塞多模型框架接入。
+        stats.unsupported++;
+        break;
+    }
+    return stats;
 }
 
 void MosaicComposer::ComposeLocked()
@@ -441,34 +549,27 @@ void MosaicComposer::ComposeLocked()
             printf("Mosaic RGA failed ch=%d status=%d\n", i, status);
             mosaic_rga_fail_count_++;
         }
-        float scale_x = static_cast<float>(dst_rect.width) / input.width;
-        float scale_y = static_cast<float>(dst_rect.height) / input.height;
-
-        for (int j = 0; j < input.results.count; ++j) 
+        if (status == IM_STATUS_SUCCESS) 
         {
-            const auto& res = input.results.results[j];
+            if (!input.model_results.empty()) 
+            {
+                for (const auto& result : input.model_results) 
+                {
+                    RenderModelResult(result, input, dst_rect, dst_img, i);
+                }
+            } 
+            else 
+            {
+                // 兼容旧路径：如果还没有 model_results，就用旧 results 画 detection。
+                ModelResult legacy;
+                legacy.model_id = "legacy-yolo";
+                legacy.type = ModelResultType::Detection;
+                legacy.ok = true;
+                legacy.detections = input.results;
 
-            int left = dst_rect.x + align_down_even(clamp_to_range(
-                static_cast<int>(res.box.left * scale_x), 0, dst_rect.width - 2));
-
-            int top = dst_rect.y + align_down_even(clamp_to_range(
-                static_cast<int>(res.box.top * scale_y), 0, dst_rect.height - 2));
-
-            int right = dst_rect.x + align_up_even(clamp_to_range(
-                static_cast<int>(res.box.right * scale_x), left - dst_rect.x + 2, dst_rect.width));
-
-            int bottom = dst_rect.y + align_up_even(clamp_to_range(
-                static_cast<int>(res.box.bottom * scale_y), top - dst_rect.y + 2, dst_rect.height));
-
-            im_rect rect;
-            rect.x = left;
-            rect.y = top;
-            rect.width = right - left;
-            rect.height = bottom - top;
-
-            imrectangle(dst_img, rect, 0x0000ff00, 4);
+                RenderModelResult(legacy, input, dst_rect, dst_img, i);
+            }
         }
-
     }
     mosaic_compose_count_++;
 

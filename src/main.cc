@@ -29,7 +29,7 @@ int main(int argc, char **argv)
     model_name = (char *)argv[1];
     // 参数三, 视频/摄像头
     // char *video_path = argv[2];
-
+ 
     // 初始化rknn线程池/Initialize the rknn thread pool
     std::atomic<int> active_channels{4};
     int threadNum = 12;
