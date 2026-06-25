@@ -28,10 +28,10 @@
 
 ## 5. Frame Result Aggregation
 
-- [ ] 5.1 Add `FrameResultAggregator` keyed by `channel_id + frame_id`.
-- [ ] 5.2 Track expected and completed model results per frame.
-- [ ] 5.3 Publish a frame when all required models are complete.
-- [ ] 5.4 Add timeout behavior for missing required or optional models.
+- [x] 5.1 Add `FrameResultAggregator` keyed by `channel_id + frame_id`.
+- [x] 5.2 Track expected and completed model results per frame.
+- [x] 5.3 Publish a frame when all required models are complete.
+- [x] 5.4 Add timeout behavior for missing required or optional models.
 - [ ] 5.5 Drop late model results for frames that have already been published or discarded.
 - [ ] 5.6 Add logs for pending size, completed fps, partial fps, timeout count, and late drop count.
 
@@ -39,16 +39,16 @@
 
 - [x] 6.1 Change `MosaicComposer::Submit()` to accept `ComposedFrame` or add a new overload.
 - [x] 6.2 Store per-channel latest frame plus all aggregated model results.
-- [ ] 6.3 Keep fixed-clock `FlowLoop` behavior unchanged.
-- [ ] 6.4 Ensure replacing latest frame releases the old display buffer reference.
-- [ ] 6.5 Ensure `Stop()` releases retained multi-model frame data safely.
+- [x] 6.3 Keep fixed-clock `FlowLoop` behavior unchanged.
+- [x] 6.4 Ensure replacing latest frame releases the old display buffer reference.
+- [x] 6.5 Ensure `Stop()` releases retained multi-model frame data safely.
 
 ## 7. Rendering
 
 - [x] 7.1 Move YOLO detection box drawing into `MosaicComposer` render path on the mosaic output buffer.
 - [x] 7.2 Scale detection coordinates from source frame coordinates to mosaic cell coordinates.
-- [ ] 7.3 Add renderer dispatch by `ModelResultType`.
-- [ ] 7.4 Add no-op renderer for unsupported result types to avoid blocking integration.
+- [x] 7.3 Add renderer dispatch by `ModelResultType`.
+- [x] 7.4 Add no-op renderer for unsupported result types to avoid blocking integration.
 - [ ] 7.5 Add render logs with drawn box count and unsupported result count.
 
 ## 8. Validation

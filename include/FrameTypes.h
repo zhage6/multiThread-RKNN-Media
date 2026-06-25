@@ -39,12 +39,6 @@ struct FrameKey
     } //<重构运算符，让frame key可以完成map的排列
 };
 
-struct ModelOutput 
-{
-    FrameContext frame;
-    ModelResult result;
-};
-
 enum class ModelResultType 
 {
     Detection,
@@ -53,6 +47,7 @@ enum class ModelResultType
     Keypoints,
     Custom
 };
+
 
 struct ModelResult 
 {
@@ -66,6 +61,15 @@ struct ModelResult
     // 第一阶段先兼容 YOLO 检测结果。
     detect_result_group_t detections {};
 };
+
+struct ModelOutput 
+{
+    FrameContext frame;
+    ModelResult result;
+};
+
+
+
 
 struct ComposedFrame 
 {

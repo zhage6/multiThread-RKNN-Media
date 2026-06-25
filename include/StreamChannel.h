@@ -11,6 +11,7 @@
 #include "StreamPublisher.h"
 #include "ThreadSafeQueue.hpp"
 #include "MosaicComposer.h"
+#include "FrameResultAggregator.h"
 
 
 struct DetectResult {
@@ -38,7 +39,7 @@ class VideoChannel
 {
     public:
         VideoChannel(int channel_id, const std::string& stream_url, 
-                    GlobalPool* pool,std::atomic<int>& active_cnt, MosaicComposer* mosaic = nullptr);
+                    GlobalPool* pool,std::atomic<int>& active_cnt, MosaicComposer* mosaic = nullptr,FrameResultAggregator* aggregator = nullptr);
         ~VideoChannel();
         void start();
         void Stop();
@@ -92,5 +93,7 @@ class VideoChannel
 
         std::atomic<bool> m_encoder_ready; //热身变量，系统等待编码器链路打通
         int m_startup_max_inflight_frames;
+
+        FrameResultAggregator* m_aggregator;
 
 };

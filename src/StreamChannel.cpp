@@ -38,7 +38,7 @@ namespace
 } // namespace
 
 VideoChannel::VideoChannel(int channel_id, const std::string& stream_url, 
-                    GlobalPool* pool,std::atomic<int>& active_cnt, MosaicComposer* mosaic)
+                    GlobalPool* pool,std::atomic<int>& active_cnt, MosaicComposer* mosaic, FrameResultAggregator* aggregator)
         : m_channel_id(channel_id), 
           m_stream_url(stream_url), 
           m_pool(pool),
@@ -46,6 +46,7 @@ VideoChannel::VideoChannel(int channel_id, const std::string& stream_url,
           m_frame_counter(0),
           m_active_count(active_cnt),
           m_mosaic(mosaic),
+          m_aggregator(aggregator),
           m_expected_frame_id(0), // 初始化期待的帧号
           m_encoder(nullptr),
           m_encode_packet_counter(0),
@@ -254,9 +255,34 @@ void VideoChannel::ProcessInferOutput(const InferOutput& out)
                         static_cast<unsigned long long>(current_out.frame_id),
                         m_reorder_buffer.size(),
                         static_cast<unsigned long long>(m_expected_frame_id));
+            
+            
+            if (m_aggregator) 
+            {
+                ComposedFrame composed = MakeYoloComposedFrame(current_out);
 
+                ModelOutput output;
+                output.frame = composed.frame;
+
+                if (!composed.results.empty()) 
+                {
+                    output.result = composed.results.front();
+                } 
+                else 
+                {
+                    output.result.model_id = "yolo";
+                    output.result.type = ModelResultType::Detection;
+                    output.result.ok = false;
+                    output.result.error = "empty yolo result";
+                }
+
+                if (!m_aggregator->Submit(std::move(output))) 
+                {
+                    release_source_buffer(current_out);
+                }
+            }            
             //EncodeZeroCopy(current_out);
-            if (m_mosaic) 
+            else if (m_mosaic) 
             {
                 m_encoder_ready = true;
                 m_mosaic->Submit(current_out);

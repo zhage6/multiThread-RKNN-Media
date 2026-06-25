@@ -66,6 +66,7 @@ add_executable(rknn_yolov5_demo
         src/MppEncoder.cpp
         src/StreamChannel.cpp
         src/MosaicComposer.cpp
+        src/FrameResultAggregator.cpp
 )
 
 target_link_libraries(rknn_yolov5_demo

@@ -186,21 +186,26 @@ void FrameResultAggregator::PublishTimeoutLocked()
 
 bool FrameResultAggregator::HasRequiredResultsLocked(const FrameAggregate& agg) const
 {
-    if (required_models_.empty()) {
+    if (required_models_.empty()) 
+    {
         return true;
     }
 
-    for (const auto& required : required_models_) {
+    for (const auto& required : required_models_) 
+    {
         bool found = false;
 
-        for (const auto& result : agg.results) {
-            if (result.model_id == required && result.ok) {
+        for (const auto& result : agg.results) 
+        {
+            if (result.model_id == required && result.ok) 
+            {
                 found = true;
                 break;
             }
         }
 
-        if (!found) {
+        if (!found) 
+        {
             return false;
         }
     }
@@ -215,17 +220,21 @@ ComposedFrame FrameResultAggregator::MakeComposedFrame(const FrameAggregate& agg
     frame.results = agg.results;
     frame.partial = partial;
 
-    for (const auto& required : required_models_) {
+    for (const auto& required : required_models_) 
+    {
         bool found = false;
 
-        for (const auto& result : agg.results) {
-            if (result.model_id == required && result.ok) {
+        for (const auto& result : agg.results) 
+        {
+            if (result.model_id == required && result.ok) 
+            {
                 found = true;
                 break;
             }
         }
 
-        if (!found) {
+        if (!found) 
+        {
             frame.missing_models.push_back(required);
         }
     }

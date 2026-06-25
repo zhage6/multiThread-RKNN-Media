@@ -12,6 +12,8 @@
 #include "MppDecoder.h"
 #include "StreamChannel.h"
 #include "MosaicComposer.h"
+#include "FrameResultAggregator.h"
+#include "FrameTypes.h"
 namespace dpool 
 {
     constexpr size_t ThreadPool::WAIT_SECONDS;
@@ -41,12 +43,26 @@ int main(int argc, char **argv)
         return -1;
     }
     MosaicComposer mosaic;
+    FrameResultAggregator aggregator;
+    aggregator.SetRequiredModels({"yolo"});
+    aggregator.SetTimeout(std::chrono::milliseconds(120));
+    aggregator.SetOutputCallback([&mosaic](const ComposedFrame& frame) 
+    {
+        mosaic.Submit(frame);
+    });
+
+    if (!aggregator.Start()) 
+    {
+        printf("FrameResultAggregator start failed\n");
+        return -1;
+    }
+
     mosaic.Init(1920, 1080, 24);
     std::vector<std::shared_ptr<VideoChannel>> channels;
-    channels.push_back(std::make_unique<VideoChannel>(0, "../test.h264", &testPool,active_channels, &mosaic));
-    channels.push_back(std::make_unique<VideoChannel>(1, "../test2.h264", &testPool,active_channels, &mosaic));
-    channels.push_back(std::make_unique<VideoChannel>(2, "../test3.h264", &testPool,active_channels, &mosaic));
-    channels.push_back(std::make_unique<VideoChannel>(3, "../test4.h264", &testPool,active_channels, &mosaic));
+    channels.push_back(std::make_unique<VideoChannel>(0, "../test.h264", &testPool,active_channels, &mosaic,&aggregator));
+    channels.push_back(std::make_unique<VideoChannel>(1, "../test2.h264", &testPool,active_channels, &mosaic,&aggregator));
+    channels.push_back(std::make_unique<VideoChannel>(2, "../test3.h264", &testPool,active_channels, &mosaic,&aggregator));
+    channels.push_back(std::make_unique<VideoChannel>(3, "../test4.h264", &testPool,active_channels, &mosaic,&aggregator));
 //    channels.push_back(std::make_unique<VideoChannel>(4, "../test5.h264", &testPool,active_channels, &mosaic));
 //    channels.push_back(std::make_unique<VideoChannel>(5, "../test6.h264", &testPool,active_channels, &mosaic));
     
@@ -112,6 +128,7 @@ int main(int argc, char **argv)
     for (auto& ch : channels) {
         ch->Stop(); 
     }
+    aggregator.Stop();
 
     printf("系统安全退出。\n");
 
