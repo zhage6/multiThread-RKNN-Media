@@ -25,6 +25,26 @@ struct FrameContext
     int ver_stride = 0;
 };
 
+struct FrameKey 
+{
+    int channel_id = -1;
+    uint64_t frame_id = 0;
+
+    bool operator<(const FrameKey& other) const
+    {
+        if (channel_id != other.channel_id) {
+            return channel_id < other.channel_id;
+        }
+        return frame_id < other.frame_id;
+    } //<重构运算符，让frame key可以完成map的排列
+};
+
+struct ModelOutput 
+{
+    FrameContext frame;
+    ModelResult result;
+};
+
 enum class ModelResultType 
 {
     Detection,
