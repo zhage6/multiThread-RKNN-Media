@@ -1,5 +1,6 @@
 #include "StreamChannel.h"
 #include "TimingLogger.h"
+#include "MultiModelPipeline.h"
 #include <algorithm>
 #include <chrono>
 
@@ -38,10 +39,10 @@ namespace
 } // namespace
 
 VideoChannel::VideoChannel(int channel_id, const std::string& stream_url, 
-                    GlobalPool* pool,std::atomic<int>& active_cnt, MosaicComposer* mosaic, FrameResultAggregator* aggregator)
+                    MultiModelPipeline* pipeline,std::atomic<int>& active_cnt, MosaicComposer* mosaic, FrameResultAggregator* aggregator)
         : m_channel_id(channel_id), 
           m_stream_url(stream_url), 
-          m_pool(pool),
+          m_pipeline(pipeline),
           m_running(false),
           m_frame_counter(0),
           m_active_count(active_cnt),
@@ -94,7 +95,8 @@ void VideoChannel::start()
                         m_input_fps,
                         m_stream_url.c_str());
         }
-        m_decoder->Init([this](int src_fd, int w, int h, int h_stride, int v_stride, MppFrame frame) {
+        m_decoder->Init([this](int src_fd, int w, int h, int h_stride, int v_stride, MppFrame frame) 
+        {
             // 当这个通道的 MPP 解出一帧时，会触发这里
             input_data data;
             data.src_fd = src_fd; 
@@ -121,9 +123,11 @@ void VideoChannel::start()
                 auto target_time = this->m_input_start_time +
                     std::chrono::microseconds(data.frame_id * 1000000 / this->m_input_fps);
 
-                while (this->m_running) {
+                while (this->m_running) 
+                {
                     auto now = std::chrono::steady_clock::now();
-                    if (now >= target_time) {
+                    if (now >= target_time) 
+                    {
                         break;
                     }
 
@@ -160,13 +164,34 @@ void VideoChannel::start()
                 }
                 return;
             }
+            FrameContext task_frame;
+            task_frame.channel_id = data.channel_id;
+            task_frame.frame_id = data.frame_id;
+            task_frame.pts_us = data.pts_us;
+            task_frame.src_fd = data.src_fd;
+            task_frame.src_buffer = data.src_buffer;
+            task_frame.width = data.width;
+            task_frame.height = data.height;
+            task_frame.hor_stride = data.hor_stride;
+            task_frame.ver_stride = data.ver_stride;
 
             m_inflight_frames++;
-            this->m_pool->put(data); 
+            bool submitted = this->m_pipeline && this->m_pipeline->Submit(task_frame);
+            if (task_frame.src_buffer) 
+            {
+                mpp_buffer_put(task_frame.src_buffer);
+                task_frame.src_buffer = nullptr;
+            }
+            if (!submitted) 
+            {
+                m_inflight_frames--;
+                return;
+            }
+
             timing::Log("decode_enqueue ch=%d frame=%llu queue=%d",
                         this->m_channel_id,
-                        static_cast<unsigned long long>(data.frame_id),
-                        this->m_pool->get_task_size());
+                        static_cast<unsigned long long>(task_frame.frame_id),
+                         this->m_pipeline->PendingCount());;
         }, 
         MPP_VIDEO_CodingAVC    
         );
@@ -178,6 +203,7 @@ void VideoChannel::Stop()
     m_running = false;
     m_encoder_ready = false;
     m_output_queue.stop();
+    m_model_output_queue.stop();  // 新 ModelOutput 路径必须加
 
     if (m_decode_thread.joinable()) {
         m_decode_thread.join();
@@ -206,10 +232,84 @@ void VideoChannel::OnInferOutput(const InferOutput& out)
 
 void VideoChannel::OutputLoop()
 {
-    InferOutput out;
-    while (m_output_queue.pop(out)) 
+    ModelOutput output;
+    while (m_model_output_queue.pop(output)) 
     {
-        ProcessInferOutput(out);
+        ProcessModelOutput(output);
+    }
+}
+
+void VideoChannel::ProcessModelOutput(const ModelOutput& output)
+{
+    std::lock_guard<std::mutex> lock(m_reorder_mtx);
+
+    uint64_t frame_id = output.frame.frame_id;
+
+    if (frame_id < m_expected_frame_id) {
+        if (m_reorder_skipped_frames.count(frame_id)) {
+            ReleaseModelOutput(output);
+            return;
+        }
+
+        SubmitModelOutputToAggregator(output);
+        return;
+    }
+
+    m_model_reorder_buffer[frame_id].push_back(output);
+
+    while (true) {
+        auto it = m_model_reorder_buffer.find(m_expected_frame_id);
+
+        if (it != m_model_reorder_buffer.end()) {
+            for (const auto& item : it->second) {
+                SubmitModelOutputToAggregator(item);
+            }
+
+            m_model_reorder_buffer.erase(it);
+            m_reorder_waiting = false;
+            m_expected_frame_id++;
+            continue;
+        }
+
+        if (m_model_reorder_buffer.empty()) {
+            m_reorder_waiting = false;
+            break;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+
+        if (!m_reorder_waiting) {
+            m_reorder_waiting = true;
+            m_reorder_wait_start = now;
+            break;
+        }
+
+        if (now - m_reorder_wait_start >= m_reorder_timeout) 
+        {
+            const uint64_t skipped_frame_id = m_expected_frame_id;
+            timing::Log("model_reorder_timeout ch=%d frame=%llu buffered=%zu",
+                m_channel_id,
+                static_cast<unsigned long long>(skipped_frame_id),
+                m_model_reorder_buffer.size());
+            m_reorder_skipped_frames.insert(skipped_frame_id);
+            if (m_aggregator) {
+                m_aggregator->SkipFrame(m_channel_id, skipped_frame_id);
+            }
+            OnFrameAggregated(skipped_frame_id);
+            m_expected_frame_id++;
+            m_reorder_waiting = false;
+            continue;
+        }
+
+        break;
+    }
+}
+
+void VideoChannel::SubmitModelOutputToAggregator(const ModelOutput& output)
+{
+    if (!m_aggregator || !m_aggregator->Submit(output)) 
+    {
+        ReleaseModelOutput(output);
     }
 }
 
@@ -257,7 +357,7 @@ void VideoChannel::ProcessInferOutput(const InferOutput& out)
                         static_cast<unsigned long long>(m_expected_frame_id));
             
             
-            if (m_aggregator) 
+            if(m_aggregator)
             {
                 ComposedFrame composed = MakeYoloComposedFrame(current_out);
 
@@ -275,7 +375,6 @@ void VideoChannel::ProcessInferOutput(const InferOutput& out)
                     output.result.ok = false;
                     output.result.error = "empty yolo result";
                 }
-
                 if (!m_aggregator->Submit(std::move(output))) 
                 {
                     release_source_buffer(current_out);
@@ -377,7 +476,7 @@ void VideoChannel::DecodeLoop()
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
 
-        while (m_pool->get_task_size() >= 40) //临时控速 //这个是推理池子
+        while (m_running && m_pipeline && m_pipeline->PendingCount() >= 40)  //临时控速 //这个是推理池子
         {
         // 如果池子满了，强行让当前读取线程睡 5 毫秒
         // 这样就不会继续往外吐 frame，MPP 解码器也就停下来了，内存涨幅瞬间停止！
@@ -529,6 +628,31 @@ void VideoChannel::EncodeZeroCopy(const InferOutput& out)
 void VideoChannel::OnInferDropped()
 {
     if (m_inflight_frames.load() > 0) {
+        m_inflight_frames--;
+    }
+}
+
+
+void VideoChannel::ReleaseModelOutput(const ModelOutput& output)
+{
+    if (output.frame.src_buffer) 
+    {
+        mpp_buffer_put(output.frame.src_buffer);
+    }
+}
+
+void VideoChannel::OnModelOutput(const ModelOutput& output)
+{
+    if (!m_model_output_queue.push(output)) 
+    {
+        ReleaseModelOutput(output);
+    }
+}
+
+void VideoChannel::OnFrameAggregated(uint64_t frame_id)
+{
+    if (m_inflight_frames.load() > 0) 
+    {
         m_inflight_frames--;
     }
 }

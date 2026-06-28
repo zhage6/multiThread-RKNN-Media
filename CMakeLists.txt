@@ -67,6 +67,7 @@ add_executable(rknn_yolov5_demo
         src/StreamChannel.cpp
         src/MosaicComposer.cpp
         src/FrameResultAggregator.cpp
+        src/MultiModelPipeline.cpp
 )
 
 target_link_libraries(rknn_yolov5_demo

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <memory>
 #include <chrono>
+#include <set>
 #include "MppDecoder.h" // 你现有的 MPP 解码器
 #include "MppEncoder.h"
 #include "rknnPool.hpp"
@@ -12,7 +13,9 @@
 #include "ThreadSafeQueue.hpp"
 #include "MosaicComposer.h"
 #include "FrameResultAggregator.h"
-
+#include "FrameTypes.h"
+#include "IModelAdapter.h"
+#include "MultiModelPipeline.h"
 
 struct DetectResult {
     int class_id;
@@ -39,12 +42,19 @@ class VideoChannel
 {
     public:
         VideoChannel(int channel_id, const std::string& stream_url, 
-                    GlobalPool* pool,std::atomic<int>& active_cnt, MosaicComposer* mosaic = nullptr,FrameResultAggregator* aggregator = nullptr);
+                    MultiModelPipeline* m_pipeline,std::atomic<int>& active_cnt, MosaicComposer* mosaic = nullptr,FrameResultAggregator* aggregator = nullptr);
         ~VideoChannel();
         void start();
         void Stop();
         void OnInferOutput(const InferOutput& out);
         void OnInferDropped();
+        void OnModelOutput(const ModelOutput& output);
+
+        
+        void ProcessModelOutput(const ModelOutput& output);
+        void ReleaseModelOutput(const ModelOutput& output);
+        void SubmitModelOutputToAggregator(const ModelOutput& output);
+        void OnFrameAggregated(uint64_t frame_id);
 
     private: 
         void DecodeLoop();
@@ -64,7 +74,7 @@ class VideoChannel
         ThreadSafeQueue<InferOutput> m_output_queue{30};
         std::atomic<bool> m_running; //线程控制标志
         uint64_t m_frame_counter; //帧计数器
-        GlobalPool* m_pool; //指向全局线程池的指针 
+        MultiModelPipeline* m_pipeline; 
         std::atomic<int>& m_active_count;     // 指向外部控制中心的计数器
 
         //编码器特性
@@ -95,5 +105,10 @@ class VideoChannel
         int m_startup_max_inflight_frames;
 
         FrameResultAggregator* m_aggregator;
+
+        //重排特性
+        ThreadSafeQueue<ModelOutput> m_model_output_queue{30};
+        std::map<uint64_t, std::vector<ModelOutput>> m_model_reorder_buffer;
+        std::set<uint64_t> m_reorder_skipped_frames;
 
 };

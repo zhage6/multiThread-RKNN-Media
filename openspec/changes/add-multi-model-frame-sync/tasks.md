@@ -9,19 +9,19 @@
 
 - [ ] 2.1 Define ownership rules for fan-out model tasks using `mpp_buffer_inc_ref` / `mpp_buffer_put`.
 - [ ] 2.2 Ensure each model task releases its source buffer reference after inference.
-- [ ] 2.3 Ensure the aggregator or mosaic latest slot owns exactly one display reference.
-- [ ] 2.4 Add failure cleanup for model submit failure, timeout, and late result discard.
+- [x] 2.3 Ensure the aggregator or mosaic latest slot owns exactly one display reference.
+- [x] 2.4 Add failure cleanup for model submit failure, timeout, and late result discard.
 
 ## 3. Model Adapter Interface
 
-- [ ] 3.1 Introduce a model adapter interface with `Submit(FrameContext)` and model result output.
-- [ ] 3.2 Wrap existing `rkYolov5s` / `rknnPool` path as the first adapter.
+- [x] 3.1 Introduce a model adapter interface with `Submit(FrameContext)` and model result output.
+- [x] 3.2 Wrap existing `rkYolov5s` / `rknnPool` path as the first adapter.
 - [ ] 3.3 Add model config describing model id, required/optional status, max inflight, timeout, and render type.
-- [ ] 3.4 Keep the single YOLO behavior working through the new adapter path.
+- [x] 3.4 Keep the single YOLO behavior working through the new adapter path.
 
 ## 4. Multi-Model Scheduling
 
-- [ ] 4.1 Add `MultiModelPipeline` to fan-out a `FrameContext` to configured model adapters.
+- [x] 4.1 Add `MultiModelPipeline` to fan-out a `FrameContext` to configured model adapters.
 - [ ] 4.2 Add per-model inflight limits so slow optional models do not consume all frame buffers.
 - [ ] 4.3 Add handling for model submit failure and inference failure.
 - [ ] 4.4 Add health logs for per-model submit fps, output fps, latency, and failure counts.
@@ -32,7 +32,7 @@
 - [x] 5.2 Track expected and completed model results per frame.
 - [x] 5.3 Publish a frame when all required models are complete.
 - [x] 5.4 Add timeout behavior for missing required or optional models.
-- [ ] 5.5 Drop late model results for frames that have already been published or discarded.
+- [x] 5.5 Drop late model results for frames that have already been published or discarded.
 - [ ] 5.6 Add logs for pending size, completed fps, partial fps, timeout count, and late drop count.
 
 ## 6. Mosaic Integration

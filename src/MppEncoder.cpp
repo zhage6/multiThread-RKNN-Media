@@ -54,7 +54,8 @@ bool RkMppEncoder::Init(int width, int height,int hor_stride, int ver_stride, Mp
     }
 
     ret = mpp_init(ctx_, MPP_CTX_ENC, type);
-    if (ret != MPP_OK) {
+    if (ret != MPP_OK) 
+    {
         printf("Encoder mpp_init 失败 ret=%d\n", ret);
         Stop();
         return false;
