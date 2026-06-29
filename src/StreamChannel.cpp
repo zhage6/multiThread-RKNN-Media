@@ -88,6 +88,10 @@ void VideoChannel::start()
 {
     if(m_running) return;
         m_running = true;
+        if (m_aggregator || m_mosaic) 
+        {
+            m_encoder_ready = true;
+        }
         m_input_start_time = std::chrono::steady_clock::now();
         if (m_throttle_local_input) {
             timing::Log("local_input_throttle_enabled ch=%d fps=%d url=%s",
@@ -141,9 +145,10 @@ void VideoChannel::start()
             // 塞入全局共享的 RKNN 线程池！
             // 注意：如果池子满了，你的 m_pool->put 会阻塞，这天然形成了对当前解码线程的“反压”
             printf("一帧解码完成\n");
+            int max_inflight = 0;
             while (m_running)
             {
-                int max_inflight = m_encoder_ready.load()
+                max_inflight = m_encoder_ready.load()
                     ? m_max_inflight_frames
                     : m_startup_max_inflight_frames;
 
@@ -173,7 +178,7 @@ void VideoChannel::start()
             task_frame.hor_stride = data.hor_stride;
             task_frame.ver_stride = data.ver_stride;
 
-            m_inflight_frames++;
+            int inflight_after = ++m_inflight_frames;
             bool submitted = this->m_pipeline && this->m_pipeline->Submit(task_frame);
             if (task_frame.src_buffer) 
             {
@@ -186,10 +191,12 @@ void VideoChannel::start()
                 return;
             }
 
-            timing::Log("decode_enqueue ch=%d frame=%llu queue=%d",
+            timing::Log("decode_enqueue ch=%d frame=%llu inflight=%d max_inflight=%d queue=%zu",
                         this->m_channel_id,
                         static_cast<unsigned long long>(task_frame.frame_id),
-                         this->m_pipeline->PendingCount());;
+                        inflight_after,
+                        max_inflight,
+                        this->m_pipeline->PendingCount());
         }, 
         MPP_VIDEO_CodingAVC    
         );
@@ -354,7 +361,10 @@ void VideoChannel::ProcessInferOutput(const InferOutput& out)
                         m_reorder_buffer.size(),
                         static_cast<unsigned long long>(m_expected_frame_id));
             
-            
+            if (m_aggregator || m_mosaic) 
+            {
+                m_encoder_ready = true;
+            }
             if(m_aggregator)
             {
                 ComposedFrame composed = MakeYoloComposedFrame(current_out);

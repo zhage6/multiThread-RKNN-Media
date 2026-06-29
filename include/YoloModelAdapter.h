@@ -1,6 +1,7 @@
 #pragma once
 
 #include "IModelAdapter.h"
+#include "TimingLogger.h"
 #include "rknnPool.hpp"
 #include "rkYolov5s.hpp"
 #include <utility>
@@ -42,7 +43,19 @@ public:
         data.frame_id = frame.frame_id;
         data.pts_us = frame.pts_us;
 
-        return pool_->put(data) == 0;
+        size_t pending_before = PendingCount();
+        bool ok = pool_->put(data) == 0;
+        size_t pending_after = PendingCount();
+
+        timing::Log("model_submit model=%s ch=%d frame=%llu ok=%d pending_before=%zu pending_after=%zu",
+                    model_id_.c_str(),
+                    frame.channel_id,
+                    static_cast<unsigned long long>(frame.frame_id),
+                    ok ? 1 : 0,
+                    pending_before,
+                    pending_after);
+
+        return ok;
     }
 
     bool TryGet(ModelOutput& output) override
@@ -70,6 +83,13 @@ public:
         output.result.type = ModelResultType::Detection;
         output.result.ok = true;
         output.result.detections = infer_out.results;
+
+        timing::Log("model_output model=%s ch=%d frame=%llu pending_after=%zu boxes=%d",
+                    model_id_.c_str(),
+                    output.frame.channel_id,
+                    static_cast<unsigned long long>(output.frame.frame_id),
+                    PendingCount(),
+                    output.result.detections.count);
 
         return true;
     }
