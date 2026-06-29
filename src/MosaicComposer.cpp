@@ -446,6 +446,28 @@ RenderStats RenderModelResult(const ModelResult& result,
                 printf("Mosaic draw box failed ch=%d box=%d status=%d\n",
                        channel_index, j, rect_status);
             }
+
+            if (res.has_landmarks) {
+                for (int k = 0; k < FACE_LANDMARK_NUM; ++k) {
+                    int src_x = clamp_to_range(res.landmarks[k][0], 0, input.width - 1);
+                    int src_y = clamp_to_range(res.landmarks[k][1], 0, input.height - 1);
+
+                    int center_x = cell_left + static_cast<int>(src_x * scale_x);
+                    int center_y = cell_top + static_cast<int>(src_y * scale_y);
+
+                    im_rect point;
+                    point.x = align_down_even(clamp_to_range(center_x - 2, cell_left, cell_right - 4));
+                    point.y = align_down_even(clamp_to_range(center_y - 2, cell_top, cell_bottom - 4));
+                    point.width = 4;
+                    point.height = 4;
+
+                    IM_STATUS point_status = imfill(dst_img, point, 0x00ff0000);
+                    if (point_status != IM_STATUS_SUCCESS) {
+                        printf("Mosaic draw landmark failed ch=%d box=%d point=%d status=%d\n",
+                               channel_index, j, k, point_status);
+                    }
+                }
+            }
         }
         stats.boxes++;
         break;

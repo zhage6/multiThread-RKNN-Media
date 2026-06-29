@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/time.h>
 
+#include <algorithm>
 #include <set>
 #include <vector>
 #define LABEL_NALE_TXT_PATH "../model/coco_80_labels_list.txt"
@@ -30,6 +31,10 @@ static char *labels[OBJ_CLASS_NUM];
 const int anchor0[6] = {10, 13, 16, 30, 33, 23};
 const int anchor1[6] = {30, 61, 62, 45, 59, 119};
 const int anchor2[6] = {116, 90, 156, 198, 373, 326};
+
+const int face_anchor0[6] = {4, 5, 8, 10, 13, 16};
+const int face_anchor1[6] = {23, 29, 43, 55, 73, 105};
+const int face_anchor2[6] = {146, 217, 231, 300, 335, 433};
 
 inline static int clamp(float val, int min, int max) { return val > min ? (val < max ? val : max) : min; }
 
@@ -358,6 +363,313 @@ int post_process(int8_t *input0, int8_t *input1, int8_t *input2, int model_in_h,
   }
   group->count = last_count;
 
+  return 0;
+}
+
+typedef struct _face_candidate_t
+{
+  float x1;
+  float y1;
+  float x2;
+  float y2;
+  float score;
+  float landmarks[FACE_LANDMARK_NUM][2];
+} face_candidate_t;
+
+static void fill_face_result_group(std::vector<face_candidate_t> &candidates, int model_in_h, int model_in_w,
+                                   float nms_threshold, BOX_RECT pads, float scale_w, float scale_h,
+                                   detect_result_group_t *group)
+{
+  if (candidates.empty())
+  {
+    group->count = 0;
+    return;
+  }
+
+  std::sort(candidates.begin(), candidates.end(), [](const face_candidate_t &a, const face_candidate_t &b) {
+    return a.score > b.score;
+  });
+
+  std::vector<int> suppressed(candidates.size(), 0);
+  int last_count = 0;
+
+  for (size_t i = 0; i < candidates.size(); ++i)
+  {
+    if (suppressed[i] || last_count >= OBJ_NUMB_MAX_SIZE)
+    {
+      continue;
+    }
+
+    const face_candidate_t &candidate = candidates[i];
+
+    float x1 = candidate.x1 - pads.left;
+    float y1 = candidate.y1 - pads.top;
+    float x2 = candidate.x2 - pads.left;
+    float y2 = candidate.y2 - pads.top;
+
+    detect_result_t &result = group->results[last_count];
+    result.box.left = (int)(clamp(x1, 0, model_in_w) / scale_w);
+    result.box.top = (int)(clamp(y1, 0, model_in_h) / scale_h);
+    result.box.right = (int)(clamp(x2, 0, model_in_w) / scale_w);
+    result.box.bottom = (int)(clamp(y2, 0, model_in_h) / scale_h);
+    result.prop = candidate.score;
+    result.has_landmarks = 1;
+    strncpy(result.name, "face", OBJ_NAME_MAX_SIZE - 1);
+    result.name[OBJ_NAME_MAX_SIZE - 1] = '\0';
+
+    for (int k = 0; k < FACE_LANDMARK_NUM; ++k)
+    {
+      float landmark_x = candidate.landmarks[k][0] - pads.left;
+      float landmark_y = candidate.landmarks[k][1] - pads.top;
+      result.landmarks[k][0] = (int)(clamp(landmark_x, 0, model_in_w) / scale_w);
+      result.landmarks[k][1] = (int)(clamp(landmark_y, 0, model_in_h) / scale_h);
+    }
+
+    last_count++;
+
+    for (size_t j = i + 1; j < candidates.size(); ++j)
+    {
+      if (suppressed[j])
+      {
+        continue;
+      }
+
+      float iou = CalculateOverlap(candidate.x1, candidate.y1, candidate.x2, candidate.y2,
+                                   candidates[j].x1, candidates[j].y1, candidates[j].x2, candidates[j].y2);
+      if (iou > nms_threshold)
+      {
+        suppressed[j] = 1;
+      }
+    }
+  }
+
+  group->count = last_count;
+}
+
+static int process_face_raw(int8_t *input, int *anchor, int grid_h, int grid_w, int stride,
+                            std::vector<face_candidate_t> &candidates, float threshold,
+                            int32_t zp, float scale, float *max_score_out)
+{
+  if (input == nullptr)
+  {
+    return 0;
+  }
+
+  int validCount = 0;
+  int grid_len = grid_h * grid_w;
+
+  for (int a = 0; a < 3; a++)
+  {
+    for (int i = 0; i < grid_h; i++)
+    {
+      for (int j = 0; j < grid_w; j++)
+      {
+        int offset = (FACE_PROP_BOX_SIZE * a) * grid_len + i * grid_w + j;
+        int8_t *in_ptr = input + offset;
+
+        float box_confidence = sigmoid(deqnt_affine_to_f32(in_ptr[4 * grid_len], zp, scale));
+        float class_confidence = sigmoid(deqnt_affine_to_f32(in_ptr[15 * grid_len], zp, scale));
+        float score = box_confidence * class_confidence;
+
+        if (max_score_out && score > *max_score_out)
+        {
+          *max_score_out = score;
+        }
+
+        if (score < threshold)
+        {
+          continue;
+        }
+
+        float box_x = sigmoid(deqnt_affine_to_f32(in_ptr[0 * grid_len], zp, scale)) * 2.0f - 0.5f;
+        float box_y = sigmoid(deqnt_affine_to_f32(in_ptr[1 * grid_len], zp, scale)) * 2.0f - 0.5f;
+        float box_w = sigmoid(deqnt_affine_to_f32(in_ptr[2 * grid_len], zp, scale)) * 2.0f;
+        float box_h = sigmoid(deqnt_affine_to_f32(in_ptr[3 * grid_len], zp, scale)) * 2.0f;
+
+        box_x = (box_x + j) * (float)stride;
+        box_y = (box_y + i) * (float)stride;
+        box_w = box_w * box_w * (float)anchor[a * 2];
+        box_h = box_h * box_h * (float)anchor[a * 2 + 1];
+
+        face_candidate_t candidate;
+        candidate.x1 = box_x - box_w / 2.0f;
+        candidate.y1 = box_y - box_h / 2.0f;
+        candidate.x2 = box_x + box_w / 2.0f;
+        candidate.y2 = box_y + box_h / 2.0f;
+        candidate.score = score;
+
+        for (int k = 0; k < FACE_LANDMARK_NUM; ++k)
+        {
+          int landmark_offset = 5 + k * 2;
+          float landmark_x = deqnt_affine_to_f32(in_ptr[landmark_offset * grid_len], zp, scale);
+          float landmark_y = deqnt_affine_to_f32(in_ptr[(landmark_offset + 1) * grid_len], zp, scale);
+          candidate.landmarks[k][0] = landmark_x * (float)anchor[a * 2] + (float)(j * stride);
+          candidate.landmarks[k][1] = landmark_y * (float)anchor[a * 2 + 1] + (float)(i * stride);
+        }
+
+        candidates.push_back(candidate);
+        validCount++;
+      }
+    }
+  }
+
+  return validCount;
+}
+
+int post_process_yolov5_face_single_float(float *input, int element_count, int model_in_h, int model_in_w,
+                                          float conf_threshold, float nms_threshold, BOX_RECT pads,
+                                          float scale_w, float scale_h,
+                                          detect_result_group_t *group)
+{
+  if (group == nullptr)
+  {
+    return -1;
+  }
+
+  memset(group, 0, sizeof(detect_result_group_t));
+
+  if (input == nullptr || element_count < FACE_PROP_BOX_SIZE)
+  {
+    return 0;
+  }
+
+  const int candidate_count = element_count / FACE_PROP_BOX_SIZE;
+  std::vector<face_candidate_t> candidates;
+  candidates.reserve(candidate_count);
+
+  float max_obj_conf = 0.0f;
+  float max_cls_conf = 0.0f;
+  float max_score = 0.0f;
+
+  for (int i = 0; i < candidate_count; ++i)
+  {
+    int base = i * FACE_PROP_BOX_SIZE;
+
+    float box_x = input[base + 0];
+    float box_y = input[base + 1];
+    float box_w = input[base + 2];
+    float box_h = input[base + 3];
+    float obj_conf = input[base + 4];
+    float cls_conf = input[base + 15];
+    float score = obj_conf * cls_conf;
+
+    max_obj_conf = fmax(max_obj_conf, obj_conf);
+    max_cls_conf = fmax(max_cls_conf, cls_conf);
+    max_score = fmax(max_score, score);
+
+    if (score < conf_threshold)
+    {
+      continue;
+    }
+
+    face_candidate_t candidate;
+    candidate.x1 = box_x - box_w / 2.0f;
+    candidate.y1 = box_y - box_h / 2.0f;
+    candidate.x2 = box_x + box_w / 2.0f;
+    candidate.y2 = box_y + box_h / 2.0f;
+    candidate.score = score;
+
+    for (int k = 0; k < FACE_LANDMARK_NUM; ++k)
+    {
+      int landmark_offset = base + 5 + k * 2;
+      candidate.landmarks[k][0] = input[landmark_offset + 0];
+      candidate.landmarks[k][1] = input[landmark_offset + 1];
+    }
+
+    candidates.push_back(candidate);
+  }
+
+  static int debug_print_count = 0;
+  if (debug_print_count < 8)
+  {
+    printf("face_post candidates=%d kept_before_nms=%zu max_obj=%f max_cls=%f max_score=%f threshold=%f\n",
+           candidate_count, candidates.size(), max_obj_conf, max_cls_conf, max_score, conf_threshold);
+    debug_print_count++;
+  }
+
+  if (candidates.empty())
+  {
+    return 0;
+  }
+
+  fill_face_result_group(candidates, model_in_h, model_in_w, nms_threshold, pads, scale_w, scale_h, group);
+  return 0;
+}
+
+int post_process_yolov5_face_single(int8_t *input, int element_count, int model_in_h, int model_in_w,
+                                    float conf_threshold, float nms_threshold, BOX_RECT pads,
+                                    float scale_w, float scale_h, int32_t zp, float scale,
+                                    detect_result_group_t *group)
+{
+  if (input == nullptr)
+  {
+    if (group != nullptr)
+    {
+      memset(group, 0, sizeof(detect_result_group_t));
+    }
+    return 0;
+  }
+
+  std::vector<float> deqnt_output(element_count);
+  for (int i = 0; i < element_count; ++i)
+  {
+    deqnt_output[i] = deqnt_affine_to_f32(input[i], zp, scale);
+  }
+
+  return post_process_yolov5_face_single_float(deqnt_output.data(), element_count, model_in_h, model_in_w,
+                                               conf_threshold, nms_threshold, pads, scale_w, scale_h, group);
+}
+
+int post_process_yolov5_face(int8_t *input0, int8_t *input1, int8_t *input2, int model_in_h, int model_in_w,
+                             float conf_threshold, float nms_threshold, BOX_RECT pads,
+                             float scale_w, float scale_h,
+                             std::vector<int32_t> &qnt_zps, std::vector<float> &qnt_scales,
+                             detect_result_group_t *group)
+{
+  if (group == nullptr)
+  {
+    return -1;
+  }
+
+  memset(group, 0, sizeof(detect_result_group_t));
+
+  if (qnt_zps.size() < 3 || qnt_scales.size() < 3)
+  {
+    return -1;
+  }
+
+  std::vector<face_candidate_t> candidates;
+  candidates.reserve((model_in_h / 8) * (model_in_w / 8));
+
+  float max_score = 0.0f;
+
+  int stride0 = 8;
+  int grid_h0 = model_in_h / stride0;
+  int grid_w0 = model_in_w / stride0;
+  process_face_raw(input0, (int *)face_anchor0, grid_h0, grid_w0, stride0, candidates,
+                   conf_threshold, qnt_zps[0], qnt_scales[0], &max_score);
+
+  int stride1 = 16;
+  int grid_h1 = model_in_h / stride1;
+  int grid_w1 = model_in_w / stride1;
+  process_face_raw(input1, (int *)face_anchor1, grid_h1, grid_w1, stride1, candidates,
+                   conf_threshold, qnt_zps[1], qnt_scales[1], &max_score);
+
+  int stride2 = 32;
+  int grid_h2 = model_in_h / stride2;
+  int grid_w2 = model_in_w / stride2;
+  process_face_raw(input2, (int *)face_anchor2, grid_h2, grid_w2, stride2, candidates,
+                   conf_threshold, qnt_zps[2], qnt_scales[2], &max_score);
+
+  static int debug_print_count = 0;
+  if (debug_print_count < 8)
+  {
+    printf("face_raw_post kept_before_nms=%zu max_score=%f threshold=%f\n",
+           candidates.size(), max_score, conf_threshold);
+    debug_print_count++;
+  }
+
+  fill_face_result_group(candidates, model_in_h, model_in_w, nms_threshold, pads, scale_w, scale_h, group);
   return 0;
 }
 

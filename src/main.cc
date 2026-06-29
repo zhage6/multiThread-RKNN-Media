@@ -24,33 +24,43 @@ namespace dpool
 int main(int argc, char **argv)
 {
     char *model_name = NULL;
-    if (argc != 2)
+    if (argc != 3)
     {
         printf("Usage: %s <rknn model> <jpg> \n", argv[0]);
         return -1;
     }
     // 参数二，模型所在路径/The path where the model is located
-    model_name = (char *)argv[1];
+    char* yolo_model = argv[1];
+    char* face_model = argv[2];
     // 参数三, 视频/摄像头
     // char *video_path = argv[2];
  
     // 初始化rknn线程池/Initialize the rknn thread pool
     std::atomic<int> active_channels{4};
-    int threadNum = 12;
+    int yoloThreadNum = 3;
+    int faceThreadNum = 9;
     int in_flight_frames = 0;
-    rknnPool<rkYolov5s, input_data, InferOutput> testPool(model_name, threadNum);
+    rknnPool<rkYolov5s, input_data, InferOutput> testPool(yolo_model, yoloThreadNum);
+    rknnPool<rkYolov5s, input_data, InferOutput> facePool(face_model, faceThreadNum);
     if (testPool.init() != 0)
     {
         printf("rknnPool init fail!\n");
         return -1;
     }
+    if (facePool.init() != 0) 
+    {
+        printf("facePool init fail!\n");
+        return -1;
+    }
     YoloModelAdapter yolo("yolo", &testPool);
+    YoloModelAdapter face("face_yolo", &facePool);
     MosaicComposer mosaic;
     std::vector<std::shared_ptr<VideoChannel>> channels;
     FrameResultAggregator aggregator;
     MultiModelPipeline pipeline;
     pipeline.AddModel(&yolo);
-    aggregator.SetRequiredModels({"yolo"});
+    pipeline.AddModel(&face);
+    aggregator.SetRequiredModels({"yolo","face_yolo"});
     aggregator.SetTimeout(std::chrono::milliseconds(120));
     aggregator.SetOutputCallback([&mosaic, &channels](const ComposedFrame& frame) 
     {

@@ -114,7 +114,9 @@ void VideoChannel::start()
             data.height = h;
             data.hor_stride = h_stride;
             data.ver_stride = v_stride;
-            data.frame = frame;
+            // MppDecoder owns and releases MppFrame after this callback returns.
+            // Async stages keep the image alive through data.src_buffer instead.
+            data.frame = nullptr;
             data.channel_id = this->m_channel_id;    // 贴上通道标签
             data.frame_id = this->m_frame_counter++; // 贴上序号标签(满了怎么办？)
             data.pts_us = -1;                        // 当前阶段没有真实 PTS，先保留字段
@@ -154,10 +156,6 @@ void VideoChannel::start()
 
             if (!m_running) 
             {
-                if (data.frame) {
-                    mpp_frame_deinit(&data.frame);
-                    data.frame = nullptr;
-                }
                 if (data.src_buffer) {
                     mpp_buffer_put(data.src_buffer);
                     data.src_buffer = nullptr;

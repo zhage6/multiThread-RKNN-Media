@@ -19,12 +19,12 @@ static void dump_tensor_attr(rknn_tensor_attr *attr)
     {
         shape_str += ", " + std::to_string(attr->dims[i]);
     }
-    // printf("  index=%d, name=%s, n_dims=%d, dims=[%s], n_elems=%d, size=%d, w_stride = %d, size_with_stride=%d, fmt=%s, "
-    //        "type=%s, qnt_type=%s, "
-    //        "zp=%d, scale=%f\n",
-    //        attr->index, attr->name, attr->n_dims, shape_str.c_str(), attr->n_elems, attr->size, attr->w_stride,
-    //        attr->size_with_stride, get_format_string(attr->fmt), get_type_string(attr->type),
-    //        get_qnt_type_string(attr->qnt_type), attr->zp, attr->scale);
+    printf("  index=%d, name=%s, n_dims=%d, dims=[%s], n_elems=%d, size=%d, w_stride = %d, size_with_stride=%d, fmt=%s, "
+           "type=%s, qnt_type=%s, "
+           "zp=%d, scale=%f\n",
+           attr->index, attr->name, attr->n_dims, shape_str.c_str(), attr->n_elems, attr->size, attr->w_stride,
+           attr->size_with_stride, get_format_string(attr->fmt), get_type_string(attr->type),
+           get_qnt_type_string(attr->qnt_type), attr->zp, attr->scale);
 }
 
 static unsigned char *load_data(FILE *fp, size_t ofst, size_t sz)
@@ -345,7 +345,7 @@ InferOutput rkYolov5s::infer(input_data data)
     memset(outputs, 0, sizeof(outputs));
     for (int i = 0; i < io_num.n_output; i++)
     {
-        outputs[i].want_float = 0;
+        outputs[i].want_float = (io_num.n_output == 1) ? 1 : 0;
     }
 
     // 模型推理/Model inference
@@ -373,8 +373,31 @@ InferOutput rkYolov5s::infer(input_data data)
         out_zps.push_back(output_attrs[i].zp);
     }
     auto post_start = timing::Clock::now();
-    post_process((int8_t *)outputs[0].buf, (int8_t *)outputs[1].buf, (int8_t *)outputs[2].buf, height, width,
-                 box_conf_threshold, nms_threshold, pads, scale_w, scale_h, out_zps, out_scales, &detect_result_group);
+    if (io_num.n_output == 1 && output_attrs[0].n_elems % FACE_PROP_BOX_SIZE == 0)
+    {
+        post_process_yolov5_face_single_float((float *)outputs[0].buf, output_attrs[0].n_elems, height, width,
+                                              box_conf_threshold, nms_threshold, pads, scale_w, scale_h,
+                                              &detect_result_group);
+    }
+    else if (io_num.n_output == 3 &&
+             output_attrs[0].n_elems == FACE_PROP_BOX_SIZE * 3 * (height / 8) * (width / 8) &&
+             output_attrs[1].n_elems == FACE_PROP_BOX_SIZE * 3 * (height / 16) * (width / 16) &&
+             output_attrs[2].n_elems == FACE_PROP_BOX_SIZE * 3 * (height / 32) * (width / 32))
+    {
+        post_process_yolov5_face((int8_t *)outputs[0].buf, (int8_t *)outputs[1].buf, (int8_t *)outputs[2].buf,
+                                 height, width, box_conf_threshold, nms_threshold, pads, scale_w, scale_h,
+                                 out_zps, out_scales, &detect_result_group);
+    }
+    else if (io_num.n_output >= 3)
+    {
+        post_process((int8_t *)outputs[0].buf, (int8_t *)outputs[1].buf, (int8_t *)outputs[2].buf, height, width,
+                     box_conf_threshold, nms_threshold, pads, scale_w, scale_h, out_zps, out_scales, &detect_result_group);
+    }
+    else
+    {
+        printf("Unsupported model output layout: output_num=%d, output0_elems=%d\n",
+               io_num.n_output, io_num.n_output > 0 ? output_attrs[0].n_elems : 0);
+    }
     auto post_end = timing::Clock::now();
 
     auto release_start = timing::Clock::now();
