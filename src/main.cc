@@ -131,7 +131,7 @@ int main(int argc, char **argv)
             // ===================================================================
             if (output.frame.channel_id >= 0 && output.frame.channel_id < channels.size())
             {
-                channels[output.frame.channel_id]->OnModelOutput(output);
+                channels[output.frame.channel_id]->OnModelOutput(output);//在这里把对应通道的帧送回对应的通道！
             }
             else
             {
