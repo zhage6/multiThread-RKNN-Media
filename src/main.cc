@@ -73,6 +73,13 @@ int main(int argc, char **argv)
 
         mosaic.Submit(frame);
     });
+    aggregator.SetDropCallback([&channels](int channel_id, uint64_t frame_id)
+    {
+        if (channel_id >= 0 && channel_id < static_cast<int>(channels.size()) && channels[channel_id]) 
+        {
+            channels[channel_id]->OnFrameAggregated(frame_id);
+        }
+    });
 
     if (!aggregator.Start()) 
     {

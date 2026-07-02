@@ -13,6 +13,7 @@
 #include "FrameTypes.h"
 
 using AggregatedFrameCallback = std::function<void(const ComposedFrame&)>;
+using DroppedFrameCallback = std::function<void(int channel_id, uint64_t frame_id)>;
 
 class FrameResultAggregator 
 {
@@ -23,6 +24,7 @@ public:
     void SetRequiredModels(std::vector<ModelId> models);
     void SetTimeout(std::chrono::milliseconds timeout);
     void SetOutputCallback(AggregatedFrameCallback cb);
+    void SetDropCallback(DroppedFrameCallback cb);
 
     bool Start();
     void Stop();
@@ -56,11 +58,14 @@ private:
     std::mutex mtx_;
     std::condition_variable cv_;
     std::deque<ModelOutput> queue_;
-    std::map<FrameKey, FrameAggregate> pending_;
-    std::map<int, uint64_t> expected_publish_frame_;
+    std::map<FrameKey, FrameAggregate> pending_;//按 channel_id + frame_id 暂存同一帧的多个模型结果
+    std::map<int, uint64_t> expected_publish_frame_; // 每一路当前允许发布的 frame_id
+    std::map<int, uint64_t> max_seen_frame_;
+    std::map<FrameKey, std::chrono::steady_clock::time_point> missing_since_;
 
     std::vector<ModelId> required_models_;
     AggregatedFrameCallback on_frame_ready_;
+    DroppedFrameCallback on_frame_dropped_;
 
     std::thread worker_;
     bool running_ = false;

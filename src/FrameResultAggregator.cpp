@@ -27,6 +27,12 @@ void FrameResultAggregator::SetOutputCallback(AggregatedFrameCallback cb)
     on_frame_ready_ = std::move(cb);
 }
 
+void FrameResultAggregator::SetDropCallback(DroppedFrameCallback cb)
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    on_frame_dropped_ = std::move(cb);
+}
+
 bool FrameResultAggregator::Start()
 {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -69,6 +75,8 @@ void FrameResultAggregator::Stop()
     }
     pending_.clear();
     expected_publish_frame_.clear();
+    max_seen_frame_.clear();
+    missing_since_.clear();
 }
 void FrameResultAggregator::ReleaseFrame(FrameContext& frame)
 {
@@ -149,6 +157,7 @@ void FrameResultAggregator::SkipFrame(int channel_id, uint64_t frame_id)
         pending_.erase(pending);
     }
 
+    missing_since_.erase(key);
     RememberFinishedLocked(key);
 
     auto expected = expected_publish_frame_.find(channel_id);
@@ -212,6 +221,11 @@ void FrameResultAggregator::AddResult(ModelOutput output)
         return;
     }
 
+    auto seen = max_seen_frame_.find(key.channel_id);
+    if (seen == max_seen_frame_.end() || key.frame_id > seen->second) {
+        max_seen_frame_[key.channel_id] = key.frame_id;
+    }
+
     auto expected = expected_publish_frame_.find(key.channel_id);
     if (expected == expected_publish_frame_.end()) {
         expected_publish_frame_[key.channel_id] = key.frame_id;
@@ -222,6 +236,7 @@ void FrameResultAggregator::AddResult(ModelOutput output)
     }
 
     auto& agg = pending_[key];
+    missing_since_.erase(key);
     bool first_result = agg.results.empty();
     if (first_result) 
     {
@@ -272,7 +287,34 @@ void FrameResultAggregator::PublishAvailableLocked()
 
             auto it = pending_.find(key);
             if (it == pending_.end()) {
-                break;
+                auto seen = max_seen_frame_.find(channel_id);
+                if (seen == max_seen_frame_.end() || seen->second <= key.frame_id) {
+                    missing_since_.erase(key);
+                    break;
+                }
+
+                auto missing = missing_since_.find(key);
+                if (missing == missing_since_.end()) {
+                    missing_since_[key] = now;
+                    break;
+                }
+
+                const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - missing->second);
+                if (waited < timeout_) {
+                    break;
+                }
+
+                auto drop_cb = on_frame_dropped_;
+                RememberFinishedLocked(key);
+                missing_since_.erase(missing);
+                expected.second++;
+
+                if (drop_cb) {
+                    drop_cb(channel_id, key.frame_id);
+                }
+
+                continue;
             }
 
             const bool ready = HasRequiredResultsLocked(it->second);
@@ -287,6 +329,7 @@ void FrameResultAggregator::PublishAvailableLocked()
             ComposedFrame frame = MakeComposedFrame(it->second, !ready);
             auto cb = on_frame_ready_;
             RememberFinishedLocked(key);
+            missing_since_.erase(key);
             pending_.erase(it);
             expected.second++;
 
