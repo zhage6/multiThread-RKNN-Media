@@ -249,13 +249,30 @@ void VideoChannel::ProcessModelOutput(const ModelOutput& output)
     std::lock_guard<std::mutex> lock(m_reorder_mtx);
 
     uint64_t frame_id = output.frame.frame_id;
+    timing::Log("model_queue_pop model=%s ch=%d frame=%llu boxes=%d",
+                output.result.model_id.c_str(),
+                output.frame.channel_id,
+                static_cast<unsigned long long>(frame_id),
+                output.result.detections.count);
 
     if (frame_id < m_expected_frame_id) {
         if (m_reorder_skipped_frames.count(frame_id)) {
+            timing::Log("model_reorder_skipped_drop model=%s ch=%d frame=%llu expected=%llu boxes=%d",
+                        output.result.model_id.c_str(),
+                        output.frame.channel_id,
+                        static_cast<unsigned long long>(frame_id),
+                        static_cast<unsigned long long>(m_expected_frame_id),
+                        output.result.detections.count);
             ReleaseModelOutput(output);
             return;
         }
 
+        timing::Log("model_reorder_late_submit model=%s ch=%d frame=%llu expected=%llu boxes=%d",
+                    output.result.model_id.c_str(),
+                    output.frame.channel_id,
+                    static_cast<unsigned long long>(frame_id),
+                    static_cast<unsigned long long>(m_expected_frame_id),
+                    output.result.detections.count);
         SubmitModelOutputToAggregator(output);
         return;
     }
@@ -653,6 +670,11 @@ void VideoChannel::OnModelOutput(const ModelOutput& output)
 {
     if (!m_model_output_queue.push(output)) 
     {
+        timing::Log("model_queue_drop model=%s ch=%d frame=%llu boxes=%d reason=full",
+                    output.result.model_id.c_str(),
+                    output.frame.channel_id,
+                    static_cast<unsigned long long>(output.frame.frame_id),
+                    output.result.detections.count);
         ReleaseModelOutput(output);
     }
 }

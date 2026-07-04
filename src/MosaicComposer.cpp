@@ -345,6 +345,25 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
     slot.hor_stride = ctx.hor_stride;
     slot.ver_stride = ctx.ver_stride;
     slot.model_results = frame.results;
+    bool has_face = false;
+    int face_boxes = 0;
+    int yolo_boxes = 0;
+    for (const auto& result : frame.results) {
+        if (result.model_id == "face_yolo") {
+            has_face = true;
+            face_boxes = result.detections.count;
+        } else if (result.model_id == "yolo") {
+            yolo_boxes = result.detections.count;
+        }
+    }
+    timing::Log("mosaic_submit ch=%d frame=%llu partial=%d results=%zu has_face=%d face_boxes=%d yolo_boxes=%d",
+                ctx.channel_id,
+                static_cast<unsigned long long>(ctx.frame_id),
+                frame.partial ? 1 : 0,
+                frame.results.size(),
+                has_face ? 1 : 0,
+                face_boxes,
+                yolo_boxes);
 
     // 先兼容 YOLO：从 composed results 里找 Detection 结果
     memset(&slot.results, 0, sizeof(slot.results));
@@ -407,6 +426,7 @@ RenderStats RenderModelResult(const ModelResult& result,
     {
     case ModelResultType::Detection:
     {
+        const int box_color = (result.model_id == "face_yolo") ? 0x000000ff : 0x0000ff00;
         const float scale_x = static_cast<float>(dst_rect.width) / input.width;
         const float scale_y = static_cast<float>(dst_rect.height) / input.height;
 
@@ -440,7 +460,7 @@ RenderStats RenderModelResult(const ModelResult& result,
             rect.width = right - left;
             rect.height = bottom - top;
 
-            IM_STATUS rect_status = imrectangle(dst_img, rect, 0x0000ff00, 4);
+            IM_STATUS rect_status = imrectangle(dst_img, rect, box_color, 4);
             if (rect_status != IM_STATUS_SUCCESS) 
             {
                 printf("Mosaic draw box failed ch=%d box=%d status=%d\n",
@@ -470,6 +490,13 @@ RenderStats RenderModelResult(const ModelResult& result,
             }
         }
         stats.boxes++;
+        if (result.model_id == "face_yolo" && result.detections.count > 0) 
+        {
+            timing::Log("mosaic_render_face ch=%d frame=%llu boxes=%d",
+                        channel_index,
+                        static_cast<unsigned long long>(input.frame_id),
+                        result.detections.count);
+        }
         break;
     }
 

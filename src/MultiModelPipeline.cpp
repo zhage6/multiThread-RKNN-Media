@@ -28,14 +28,21 @@ bool MultiModelPipeline::Submit(const FrameContext& frame)
 
         FrameContext task_frame = frame;
 
-        if (task_frame.src_buffer) {
+        if (task_frame.src_buffer) 
+        {
             mpp_buffer_inc_ref(task_frame.src_buffer);
         }
 
-        if (model->Submit(task_frame)) {
+        if (model->Submit(task_frame, [this](ModelOutput output)
+        {
+            PushCompleted(std::move(output));
+        })) 
+        {
             any_submitted = true;
-        } else {
-            if (task_frame.src_buffer) {
+        } else 
+        {
+            if (task_frame.src_buffer) 
+            {
                 mpp_buffer_put(task_frame.src_buffer);
             }
         }
@@ -55,10 +62,32 @@ size_t MultiModelPipeline::PendingCount() const
         }
     }
 
+    {
+        std::lock_guard<std::mutex> lock(completed_mtx_);
+        total += completed_outputs_.size();
+    }
+
     return total;
 }
+
+void MultiModelPipeline::PushCompleted(ModelOutput output)
+{
+    std::lock_guard<std::mutex> lock(completed_mtx_);
+    completed_outputs_.push_back(std::move(output));
+}
+
 bool MultiModelPipeline::TryGet(ModelOutput& output)
 {
+    {
+        std::lock_guard<std::mutex> lock(completed_mtx_);
+        if (!completed_outputs_.empty()) 
+        {
+            output = std::move(completed_outputs_.front());
+            completed_outputs_.pop_front();
+            return true;
+        }
+    }
+
     for (auto* model : models_) 
     {
         if (model && model->TryGet(output)) 
@@ -66,5 +95,6 @@ bool MultiModelPipeline::TryGet(ModelOutput& output)
             return true;
         }
     }
+
     return false;
 }

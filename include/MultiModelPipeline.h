@@ -1,6 +1,8 @@
 #pragma once
 
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "IModelAdapter.h"
@@ -18,5 +20,10 @@ public:
     size_t PendingCount() const;
 
 private:
+    void PushCompleted(ModelOutput output);
+
+private:
     std::vector<IModelAdapter*> models_;
+    mutable std::mutex completed_mtx_;
+    std::deque<ModelOutput> completed_outputs_;
 };

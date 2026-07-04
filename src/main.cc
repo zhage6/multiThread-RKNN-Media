@@ -38,7 +38,7 @@ int main(int argc, char **argv)
     // 初始化rknn线程池/Initialize the rknn thread pool
     std::atomic<int> active_channels{4};
     int yoloThreadNum = 3;
-    int faceThreadNum = 9;
+    int faceThreadNum = 3;
     int in_flight_frames = 0;
     rknnPool<rkYolov5s, input_data, InferOutput> testPool(yolo_model, yoloThreadNum);
     rknnPool<rkYolov5s, input_data, InferOutput> facePool(face_model, faceThreadNum);
@@ -61,6 +61,7 @@ int main(int argc, char **argv)
     pipeline.AddModel(&yolo);
     pipeline.AddModel(&face);
     aggregator.SetRequiredModels({"yolo","face_yolo"});
+    //aggregator.SetRequiredModels({"face_yolo"});
     aggregator.SetTimeout(std::chrono::milliseconds(120));
     aggregator.SetOutputCallback([&mosaic, &channels](const ComposedFrame& frame) 
     {

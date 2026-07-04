@@ -1,4 +1,5 @@
 #include "FrameResultAggregator.h"
+#include "TimingLogger.h"
 
 FrameResultAggregator::FrameResultAggregator()
 {
@@ -130,6 +131,11 @@ bool FrameResultAggregator::Submit(ModelOutput output)
 
     if (IsFinishedLocked(key)) 
     {
+        timing::Log("agg_submit_finished_drop model=%s ch=%d frame=%llu boxes=%d",
+                    output.result.model_id.c_str(),
+                    key.channel_id,
+                    static_cast<unsigned long long>(key.frame_id),
+                    output.result.detections.count);
         ReleaseOutput(output);
         return true;
     }
@@ -217,6 +223,11 @@ void FrameResultAggregator::AddResult(ModelOutput output)
 
     if (IsFinishedLocked(key)) 
     {
+        timing::Log("agg_late_drop model=%s ch=%d frame=%llu reason=finished boxes=%d",
+                    output.result.model_id.c_str(),
+                    key.channel_id,
+                    static_cast<unsigned long long>(key.frame_id),
+                    output.result.detections.count);
         ReleaseOutput(output);
         return;
     }
@@ -230,6 +241,12 @@ void FrameResultAggregator::AddResult(ModelOutput output)
     if (expected == expected_publish_frame_.end()) {
         expected_publish_frame_[key.channel_id] = key.frame_id;
     } else if (key.frame_id < expected->second) {
+        timing::Log("agg_late_drop model=%s ch=%d frame=%llu reason=behind_expected expected=%llu boxes=%d",
+                    output.result.model_id.c_str(),
+                    key.channel_id,
+                    static_cast<unsigned long long>(key.frame_id),
+                    static_cast<unsigned long long>(expected->second),
+                    output.result.detections.count);
         ReleaseOutput(output);
         RememberFinishedLocked(key);
         return;
@@ -257,6 +274,13 @@ void FrameResultAggregator::AddResult(ModelOutput output)
     }
 
     agg.results.push_back(std::move(output.result));
+    timing::Log("agg_add model=%s ch=%d frame=%llu results=%zu boxes=%d first=%d",
+                agg.results.back().model_id.c_str(),
+                key.channel_id,
+                static_cast<unsigned long long>(key.frame_id),
+                agg.results.size(),
+                agg.results.back().detections.count,
+                first_result ? 1 : 0);
     if (!first_result) 
     {
         ReleaseFrame(output.frame);
@@ -306,6 +330,11 @@ void FrameResultAggregator::PublishAvailableLocked()
                 }
 
                 auto drop_cb = on_frame_dropped_;
+                timing::Log("agg_missing_drop ch=%d frame=%llu max_seen=%llu waited_ms=%lld",
+                            channel_id,
+                            static_cast<unsigned long long>(key.frame_id),
+                            static_cast<unsigned long long>(seen->second),
+                            static_cast<long long>(waited.count()));
                 RememberFinishedLocked(key);
                 missing_since_.erase(missing);
                 expected.second++;
@@ -327,6 +356,26 @@ void FrameResultAggregator::PublishAvailableLocked()
             }
 
             ComposedFrame frame = MakeComposedFrame(it->second, !ready);
+            bool has_face = false;
+            int face_boxes = 0;
+            int yolo_boxes = 0;
+            for (const auto& result : frame.results) {
+                if (result.model_id == "face_yolo") {
+                    has_face = true;
+                    face_boxes = result.detections.count;
+                } else if (result.model_id == "yolo") {
+                    yolo_boxes = result.detections.count;
+                }
+            }
+            timing::Log("agg_publish ch=%d frame=%llu partial=%d results=%zu has_face=%d face_boxes=%d yolo_boxes=%d waited_ms=%lld",
+                        channel_id,
+                        static_cast<unsigned long long>(key.frame_id),
+                        frame.partial ? 1 : 0,
+                        frame.results.size(),
+                        has_face ? 1 : 0,
+                        face_boxes,
+                        yolo_boxes,
+                        static_cast<long long>(waited.count()));
             auto cb = on_frame_ready_;
             RememberFinishedLocked(key);
             missing_since_.erase(key);
