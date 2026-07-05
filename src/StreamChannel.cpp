@@ -54,7 +54,7 @@ VideoChannel::VideoChannel(int channel_id, const std::string& stream_url,
           m_last_packet_pts(-1),
           m_output_fps(24),
           m_throttle_local_input(is_local_stream_url(stream_url)),
-          m_input_fps(24),
+          m_input_fps(12),
           m_reorder_waiting(false),
           m_reorder_timeout(std::chrono::milliseconds(120)),
           m_reorder_drop_count(0),
@@ -93,7 +93,8 @@ void VideoChannel::start()
             m_encoder_ready = true;
         }
         m_input_start_time = std::chrono::steady_clock::now();
-        if (m_throttle_local_input) {
+        if (m_throttle_local_input) 
+        {
             timing::Log("local_input_throttle_enabled ch=%d fps=%d url=%s",
                         m_channel_id,
                         m_input_fps,

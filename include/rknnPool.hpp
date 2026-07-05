@@ -16,6 +16,7 @@ class rknnPool
 private:
     int threadNum;
     std::string modelPath;
+    std::vector<int> coreIds;
 
     long long id;
     std::mutex idMtx, queueMtx;
@@ -29,6 +30,7 @@ protected:
 
 public:
     rknnPool(const std::string modelPath, int threadNum);
+    rknnPool(const std::string modelPath, int threadNum, std::vector<int> coreIds);
     int init();
     // 模型推理/Model inference
     int put(inputType inputData);
@@ -52,6 +54,15 @@ rknnPool<rknnModel, inputType, outputType>::rknnPool(const std::string modelPath
 }
 
 template <typename rknnModel, typename inputType, typename outputType>
+rknnPool<rknnModel, inputType, outputType>::rknnPool(const std::string modelPath, int threadNum, std::vector<int> coreIds) //构造函数
+{
+    this->modelPath = modelPath;
+    this->threadNum = threadNum;
+    this->coreIds = std::move(coreIds);
+    this->id = 0;
+}
+
+template <typename rknnModel, typename inputType, typename outputType>
 int rknnPool<rknnModel, inputType, outputType>::init()
 {
     try
@@ -68,7 +79,8 @@ int rknnPool<rknnModel, inputType, outputType>::init()
     // 初始化模型/Initialize the model
     for (int i = 0, ret = 0; i < threadNum; i++)
     {
-        ret = models[i]->init(models[0]->get_pctx(), i != 0);
+        int coreId = coreIds.empty() ? -1 : coreIds[i % coreIds.size()];
+        ret = models[i]->init(models[0]->get_pctx(), i != 0, coreId);
         if (ret != 0)
             return ret;
     }

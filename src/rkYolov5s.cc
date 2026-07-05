@@ -105,7 +105,7 @@ rkYolov5s::rkYolov5s(const std::string &model_path)
     box_conf_threshold = BOX_THRESH; // 默认的置信度阈值
 }
 
-int rkYolov5s::init(rknn_context *ctx_in, bool share_weight)
+int rkYolov5s::init(rknn_context *ctx_in, bool share_weight, int core_id)
 {
     printf("Loading model...\n");
     int model_data_size = 0;
@@ -122,8 +122,13 @@ int rkYolov5s::init(rknn_context *ctx_in, bool share_weight)
     }
 
     // 设置模型绑定的核心/Set the core of the model that needs to be bound
+    if (core_id < 0) {
+        core_id = get_core_num();
+    }
+    core_id = ((core_id % 3) + 3) % 3;
+
     rknn_core_mask core_mask;
-    switch (get_core_num())
+    switch (core_id)
     {
     case 0:
         core_mask = RKNN_NPU_CORE_0;
@@ -134,7 +139,11 @@ int rkYolov5s::init(rknn_context *ctx_in, bool share_weight)
     case 2:
         core_mask = RKNN_NPU_CORE_2;
         break;
+    default:
+        core_mask = RKNN_NPU_CORE_0;
+        break;
     }
+    printf("rknn bind npu core=%d\n", core_id);
     ret = rknn_set_core_mask(ctx, core_mask);
     if (ret < 0)
     {

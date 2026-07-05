@@ -68,7 +68,7 @@ private:
 public:
     int GetInputFd();
     rkYolov5s(const std::string &model_path);
-    int init(rknn_context *ctx_in, bool isChild);
+    int init(rknn_context *ctx_in, bool isChild, int core_id = -1);
     rknn_context *get_pctx();
     //cv::Mat infer(cv::Mat &ori_img);
     InferOutput infer(input_data data);
