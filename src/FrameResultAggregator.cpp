@@ -1,6 +1,23 @@
 #include "FrameResultAggregator.h"
 #include "TimingLogger.h"
 
+#include <string>
+
+namespace
+{
+    std::string ResultModelsString(const std::vector<ModelResult>& results)
+    {
+        std::string models;
+        for (const auto& result : results) {
+            if (!models.empty()) {
+                models += ",";
+            }
+            models += result.model_id;
+        }
+        return models;
+    }
+}
+
 FrameResultAggregator::FrameResultAggregator()
 {
 }
@@ -154,11 +171,19 @@ void FrameResultAggregator::SkipFrame(int channel_id, uint64_t frame_id)
     key.frame_id = frame_id;
 
     if (IsFinishedLocked(key)) {
+        timing::Log("agg_skip_already_finished ch=%d frame=%llu",
+                    channel_id,
+                    static_cast<unsigned long long>(frame_id));
         return;
     }
 
     auto pending = pending_.find(key);
     if (pending != pending_.end()) {
+        timing::Log("agg_skip_release_pending ch=%d frame=%llu results=%zu models=%s",
+                    channel_id,
+                    static_cast<unsigned long long>(frame_id),
+                    pending->second.results.size(),
+                    ResultModelsString(pending->second.results).c_str());
         ReleaseAggregate(pending->second);
         pending_.erase(pending);
     }
@@ -172,6 +197,11 @@ void FrameResultAggregator::SkipFrame(int channel_id, uint64_t frame_id)
     } else if (frame_id >= expected->second) {
         expected->second = frame_id + 1;
     }
+
+    timing::Log("agg_skip_frame ch=%d frame=%llu next_expected=%llu",
+                channel_id,
+                static_cast<unsigned long long>(frame_id),
+                static_cast<unsigned long long>(expected_publish_frame_[channel_id]));
 
     PublishAvailableLocked();
 }
@@ -235,6 +265,10 @@ void FrameResultAggregator::AddResult(ModelOutput output)
     auto seen = max_seen_frame_.find(key.channel_id);
     if (seen == max_seen_frame_.end() || key.frame_id > seen->second) {
         max_seen_frame_[key.channel_id] = key.frame_id;
+        timing::Log("agg_max_seen_update ch=%d frame=%llu model=%s",
+                    key.channel_id,
+                    static_cast<unsigned long long>(key.frame_id),
+                    output.result.model_id.c_str());
     }
 
     auto expected = expected_publish_frame_.find(key.channel_id);
@@ -259,6 +293,10 @@ void FrameResultAggregator::AddResult(ModelOutput output)
     {
         agg.frame = output.frame;
         agg.first_seen = std::chrono::steady_clock::now();
+        timing::Log("agg_first_result model=%s ch=%d frame=%llu",
+                    output.result.model_id.c_str(),
+                    key.channel_id,
+                    static_cast<unsigned long long>(key.frame_id));
     }
 
 
@@ -320,6 +358,10 @@ void FrameResultAggregator::PublishAvailableLocked()
                 auto missing = missing_since_.find(key);
                 if (missing == missing_since_.end()) {
                     missing_since_[key] = now;
+                    timing::Log("agg_missing_start ch=%d frame=%llu max_seen=%llu",
+                                channel_id,
+                                static_cast<unsigned long long>(key.frame_id),
+                                static_cast<unsigned long long>(seen->second));
                     break;
                 }
 
@@ -356,6 +398,7 @@ void FrameResultAggregator::PublishAvailableLocked()
             }
 
             ComposedFrame frame = MakeComposedFrame(it->second, !ready);
+            const std::string models = ResultModelsString(it->second.results);
             bool has_face = false;
             int face_boxes = 0;
             int yolo_boxes = 0;
@@ -367,11 +410,13 @@ void FrameResultAggregator::PublishAvailableLocked()
                     yolo_boxes = result.detections.count;
                 }
             }
-            timing::Log("agg_publish ch=%d frame=%llu partial=%d results=%zu has_face=%d face_boxes=%d yolo_boxes=%d waited_ms=%lld",
+            timing::Log("agg_publish ch=%d frame=%llu partial=%d ready=%d results=%zu models=%s has_face=%d face_boxes=%d yolo_boxes=%d waited_ms=%lld",
                         channel_id,
                         static_cast<unsigned long long>(key.frame_id),
                         frame.partial ? 1 : 0,
+                        ready ? 1 : 0,
                         frame.results.size(),
+                        models.c_str(),
                         has_face ? 1 : 0,
                         face_boxes,
                         yolo_boxes,

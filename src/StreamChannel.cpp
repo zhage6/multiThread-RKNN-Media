@@ -283,6 +283,12 @@ void VideoChannel::ProcessModelOutput(const ModelOutput& output)
         auto it = m_model_reorder_buffer.find(m_expected_frame_id);
 
         if (it != m_model_reorder_buffer.end()) {
+            timing::Log("model_reorder_forward ch=%d frame=%llu outputs=%zu expected=%llu buffered=%zu",
+                        m_channel_id,
+                        static_cast<unsigned long long>(m_expected_frame_id),
+                        it->second.size(),
+                        static_cast<unsigned long long>(m_expected_frame_id),
+                        m_model_reorder_buffer.size());
             for (const auto& item : it->second) {
                 SubmitModelOutputToAggregator(item);
             }
@@ -313,6 +319,13 @@ void VideoChannel::ProcessModelOutput(const ModelOutput& output)
                 m_channel_id,
                 static_cast<unsigned long long>(skipped_frame_id),
                 m_model_reorder_buffer.size());
+            if (!m_model_reorder_buffer.empty()) {
+                timing::Log("model_reorder_timeout_detail ch=%d skipped=%llu next_buffered=%llu last_buffered=%llu",
+                            m_channel_id,
+                            static_cast<unsigned long long>(skipped_frame_id),
+                            static_cast<unsigned long long>(m_model_reorder_buffer.begin()->first),
+                            static_cast<unsigned long long>(m_model_reorder_buffer.rbegin()->first));
+            }
             m_reorder_skipped_frames.insert(skipped_frame_id);
             if (m_aggregator) {
                 m_aggregator->SkipFrame(m_channel_id, skipped_frame_id);
@@ -331,6 +344,11 @@ void VideoChannel::SubmitModelOutputToAggregator(const ModelOutput& output)
 {
     if (!m_aggregator || !m_aggregator->Submit(output)) 
     {
+        timing::Log("model_agg_submit_fail model=%s ch=%d frame=%llu boxes=%d",
+                    output.result.model_id.c_str(),
+                    output.frame.channel_id,
+                    static_cast<unsigned long long>(output.frame.frame_id),
+                    output.result.detections.count);
         ReleaseModelOutput(output);
     }
 }
