@@ -10,6 +10,7 @@
 #include <chrono>
 #include <algorithm>
 #include <thread>
+#include <map>
 #include <rockchip/mpp_buffer.h>
 #include "rkYolov5s.hpp"
 #include <vector>
@@ -104,6 +105,7 @@ private:
     std::thread flow_thread_;
     std::condition_variable flow_cv_;
     bool flow_running_ = false;
+    std::array<std::map<ModelId, ModelResult>, kChannels> reusable_model_results_;
 
     std::vector<MosaicDmaBuffer> output_buffers_;
     MppBufferGroup mosaic_grp_ = nullptr;

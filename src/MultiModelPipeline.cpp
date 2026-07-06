@@ -1,15 +1,19 @@
 #include "MultiModelPipeline.h"
 
+#include <algorithm>
 #include <rockchip/mpp_buffer.h>
 
 MultiModelPipeline::MultiModelPipeline()
 {
 }
 
-void MultiModelPipeline::AddModel(IModelAdapter* model)
+void MultiModelPipeline::AddModel(IModelAdapter* model, uint32_t frame_interval)
 {
     if (model) {
-        models_.push_back(model);
+        ModelEntry entry;
+        entry.model = model;
+        entry.frame_interval = std::max(1u, frame_interval);
+        models_.push_back(entry);
     }
 }
 
@@ -21,8 +25,14 @@ bool MultiModelPipeline::Submit(const FrameContext& frame)
 
     bool any_submitted = false;
 
-    for (auto* model : models_) {
+    for (auto& entry : models_) {
+        IModelAdapter* model = entry.model;
         if (!model) {
+            continue;
+        }
+
+        if (entry.frame_interval > 1 &&
+            frame.frame_id % entry.frame_interval != 0) {
             continue;
         }
 
@@ -56,7 +66,8 @@ size_t MultiModelPipeline::PendingCount() const
 {
     size_t total = 0;
 
-    for (auto* model : models_) {
+    for (auto& entry : models_) {
+        IModelAdapter* model = entry.model;
         if (model) {
             total += model->PendingCount();
         }
@@ -88,8 +99,9 @@ bool MultiModelPipeline::TryGet(ModelOutput& output)
         }
     }
 
-    for (auto* model : models_) 
+    for (auto& entry : models_)
     {
+        IModelAdapter* model = entry.model;
         if (model && model->TryGet(output)) 
         {
             return true;

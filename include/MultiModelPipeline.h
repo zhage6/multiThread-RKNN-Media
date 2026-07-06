@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -11,7 +12,7 @@ class MultiModelPipeline
 {
 public:
     MultiModelPipeline();
-    void AddModel(IModelAdapter* model);
+    void AddModel(IModelAdapter* model, uint32_t frame_interval = 1);
 
     bool Submit(const FrameContext& frame);
 
@@ -23,7 +24,12 @@ private:
     void PushCompleted(ModelOutput output);
 
 private:
-    std::vector<IModelAdapter*> models_;
+    struct ModelEntry {
+        IModelAdapter* model = nullptr;
+        uint32_t frame_interval = 1;
+    };
+
+    std::vector<ModelEntry> models_;
     mutable std::mutex completed_mtx_;
     std::deque<ModelOutput> completed_outputs_;
 };

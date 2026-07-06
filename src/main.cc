@@ -59,10 +59,9 @@ int main(int argc, char **argv)
     std::vector<std::shared_ptr<VideoChannel>> channels;
     FrameResultAggregator aggregator;
     MultiModelPipeline pipeline;
-    pipeline.AddModel(&yolo);
-    pipeline.AddModel(&face);
-    aggregator.SetRequiredModels({"yolo","face_yolo"});
-    //aggregator.SetRequiredModels({"face_yolo"});
+    pipeline.AddModel(&yolo, 1);
+    pipeline.AddModel(&face, 3);
+    aggregator.SetRequiredModels({"yolo"});
     aggregator.SetTimeout(std::chrono::milliseconds(240));
     aggregator.SetOutputCallback([&mosaic, &channels](const ComposedFrame& frame) 
     {

@@ -123,6 +123,9 @@ bool MosaicComposer::Init(int out_width, int out_height, int fps)
     stats_last_push_count_ = 0;
     stats_last_busy_drop_count_ = 0;
     submit_count_.fill(0);
+    for (auto& cache : reusable_model_results_) {
+        cache.clear();
+    }
     stream_start_time_ = std::chrono::steady_clock::now();
     stats_last_ = stream_start_time_;
 
@@ -226,6 +229,9 @@ void MosaicComposer::Stop()
     for (auto& input : latest_) {
         ReleaseInput(input);
     }
+    for (auto& cache : reusable_model_results_) {
+        cache.clear();
+    }
 
     if (encoder_) {
         encoder_->Stop();
@@ -261,17 +267,6 @@ void MosaicComposer::ReleaseOutputBuffers()
 
 void MosaicComposer::ReleaseInput(MosaicInput& input)
 {
-    if (input.src_buffer) 
-    {
-        mpp_buffer_put(input.src_buffer);
-        input.src_buffer = nullptr;
-    }
-
-    input.src_fd = -1;
-    input.channel_id = -1;
-    input.frame_id = 0;
-    input.pts_us = -1;
-    input.valid = false;
     if (input.src_buffer) 
     {
         mpp_buffer_put(input.src_buffer);
@@ -345,6 +340,28 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
     slot.hor_stride = ctx.hor_stride;
     slot.ver_stride = ctx.ver_stride;
     slot.model_results = frame.results;
+
+    for (const auto& result : frame.results) {
+        if (result.ok && result.model_id == "face_yolo") {
+            reusable_model_results_[ctx.channel_id][result.model_id] = result;
+        }
+    }
+
+    bool has_face_result = false;
+    for (const auto& result : slot.model_results) {
+        if (result.model_id == "face_yolo") {
+            has_face_result = true;
+            break;
+        }
+    }
+
+    if (!has_face_result) {
+        auto cached = reusable_model_results_[ctx.channel_id].find("face_yolo");
+        if (cached != reusable_model_results_[ctx.channel_id].end()) {
+            slot.model_results.push_back(cached->second);
+        }
+    }
+
     bool has_face = false;
     int face_boxes = 0;
     int yolo_boxes = 0;
