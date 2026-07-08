@@ -1,4 +1,5 @@
 #include "MultiModelPipeline.h"
+#include "FrameResultAggregator.h"
 
 #include <algorithm>
 #include <rockchip/mpp_buffer.h>
@@ -17,25 +18,53 @@ void MultiModelPipeline::AddModel(IModelAdapter* model, uint32_t frame_interval)
     }
 }
 
+void MultiModelPipeline::SetAggregator(FrameResultAggregator* aggregator)
+{
+    aggregator_ = aggregator;
+}
+
 bool MultiModelPipeline::Submit(const FrameContext& frame)
 {
-    if (models_.empty()) {
+    if (models_.empty()) 
+    {
         return false;
     }
 
-    bool any_submitted = false;
+    std::vector<ModelEntry*> selected_models;
+    std::vector<ModelId> expected_models;
 
-    for (auto& entry : models_) {
+    for (auto& entry : models_) 
+    {
         IModelAdapter* model = entry.model;
-        if (!model) {
+        if (!model) 
+        {
             continue;
         }
 
         if (entry.frame_interval > 1 &&
-            frame.frame_id % entry.frame_interval != 0) {
+            frame.frame_id % entry.frame_interval != 0) //这里直接通过帧号对模型进行间隔采样，frame_interval=1表示每帧都送去推理，frame_interval=2表示每两帧送去推理一次
+        {
             continue;
         }
 
+        selected_models.push_back(&entry);
+        expected_models.push_back(model->ModelName());
+    }
+
+    if (selected_models.empty()) 
+    {
+        return false;
+    }
+
+    if (aggregator_) {
+        aggregator_->RegisterExpectedModels(frame, expected_models);
+    }
+
+    bool any_submitted = false;
+
+    for (auto* entry : selected_models) 
+    {
+        IModelAdapter* model = entry->model;
         FrameContext task_frame = frame;
 
         if (task_frame.src_buffer) 

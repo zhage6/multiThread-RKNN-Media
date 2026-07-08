@@ -95,6 +95,7 @@ void FrameResultAggregator::Stop()
     expected_publish_frame_.clear();
     max_seen_frame_.clear();
     missing_since_.clear();
+    expected_models_.clear();
 }
 void FrameResultAggregator::ReleaseFrame(FrameContext& frame)
 {
@@ -162,6 +163,25 @@ bool FrameResultAggregator::Submit(ModelOutput output)
     return true;
 }
 
+void FrameResultAggregator::RegisterExpectedModels(const FrameContext& frame, std::vector<ModelId> models)
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    if (models.empty()) {
+        return;
+    }
+
+    FrameKey key;
+    key.channel_id = frame.channel_id;
+    key.frame_id = frame.frame_id;
+
+    if (IsFinishedLocked(key)) {
+        return;
+    }
+
+    expected_models_[key] = std::move(models);
+}
+
 void FrameResultAggregator::SkipFrame(int channel_id, uint64_t frame_id)
 {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -189,6 +209,7 @@ void FrameResultAggregator::SkipFrame(int channel_id, uint64_t frame_id)
     }
 
     missing_since_.erase(key);
+    expected_models_.erase(key);
     RememberFinishedLocked(key);
 
     auto expected = expected_publish_frame_.find(channel_id);
@@ -263,7 +284,8 @@ void FrameResultAggregator::AddResult(ModelOutput output)
     }
 
     auto seen = max_seen_frame_.find(key.channel_id);
-    if (seen == max_seen_frame_.end() || key.frame_id > seen->second) {
+    if (seen == max_seen_frame_.end() || key.frame_id > seen->second) //刷新见过的最大帧
+    {
         max_seen_frame_[key.channel_id] = key.frame_id;
         timing::Log("agg_max_seen_update ch=%d frame=%llu model=%s",
                     key.channel_id,
@@ -271,10 +293,13 @@ void FrameResultAggregator::AddResult(ModelOutput output)
                     output.result.model_id.c_str());
     }
 
-    auto expected = expected_publish_frame_.find(key.channel_id);
-    if (expected == expected_publish_frame_.end()) {
+    auto expected = expected_publish_frame_.find(key.channel_id);// 初始化要发布的第一帧
+    if (expected == expected_publish_frame_.end()) 
+    {
         expected_publish_frame_[key.channel_id] = key.frame_id;
-    } else if (key.frame_id < expected->second) {
+    } 
+    else if (key.frame_id < expected->second) //帧来晚了，expect已经是当前要发布的帧，这个窗口已经过了相当于
+    {
         timing::Log("agg_late_drop model=%s ch=%d frame=%llu reason=behind_expected expected=%llu boxes=%d",
                     output.result.model_id.c_str(),
                     key.channel_id,
@@ -286,9 +311,9 @@ void FrameResultAggregator::AddResult(ModelOutput output)
         return;
     }
 
-    auto& agg = pending_[key];
+    auto& agg = pending_[key]; //查找聚合帧map中有没有对应的那一帧
     missing_since_.erase(key);
-    bool first_result = agg.results.empty();
+    bool first_result = agg.results.empty();//如果是模型的某一帧中的第一帧结果则记上时间，方便后续做超时计算
     if (first_result) 
     {
         agg.frame = output.frame;
@@ -319,7 +344,7 @@ void FrameResultAggregator::AddResult(ModelOutput output)
                 agg.results.size(),
                 agg.results.back().detections.count,
                 first_result ? 1 : 0);
-    if (!first_result) 
+    if (!first_result) //如果再来第二个模型的应该释放一次模型引用，因为在推理前，每一帧都加了二次引用(不同模型)！
     {
         ReleaseFrame(output.frame);
     }
@@ -339,19 +364,23 @@ void FrameResultAggregator::PublishAvailableLocked()
 {
     auto now = std::chrono::steady_clock::now();
 
-    for (auto& expected : expected_publish_frame_) {
+    for (auto& expected : expected_publish_frame_) 
+    {
         const int channel_id = expected.first;
 
-        while (true) {
+        while (true) 
+        {
             FrameKey key;
             key.channel_id = channel_id;
             key.frame_id = expected.second;
 
             auto it = pending_.find(key);
-            if (it == pending_.end()) {
+            if (it == pending_.end())  //如果没找到(也就是说没有这一帧)
+            {
                 auto seen = max_seen_frame_.find(channel_id);
-                if (seen == max_seen_frame_.end() || seen->second <= key.frame_id) {
-                    missing_since_.erase(key);
+                if (seen == max_seen_frame_.end() || seen->second <= key.frame_id) 
+                {
+                    missing_since_.erase(key);//这个就是为了后面弥补等到的results
                     break;
                 }
 
@@ -367,7 +396,8 @@ void FrameResultAggregator::PublishAvailableLocked()
 
                 const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - missing->second);
-                if (waited < timeout_) {
+                if (waited < timeout_) 
+                {
                     break;
                 }
 
@@ -379,6 +409,7 @@ void FrameResultAggregator::PublishAvailableLocked()
                             static_cast<long long>(waited.count()));
                 RememberFinishedLocked(key);
                 missing_since_.erase(missing);
+                expected_models_.erase(key);
                 expected.second++;
 
                 if (drop_cb) {
@@ -388,16 +419,17 @@ void FrameResultAggregator::PublishAvailableLocked()
                 continue;
             }
 
-            const bool ready = HasRequiredResultsLocked(it->second);
+            const bool ready = HasRequiredResultsLocked(key, it->second);
             const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - it->second.first_seen);
             const bool timed_out = waited >= timeout_;
 
-            if (!ready && !timed_out) {
-                break;
+            if (!ready && !timed_out) 
+            {
+                break; //要两个都满足也就是模型没到齐，同时没超时才会接着等，不然就直接submit了
             }
 
-            ComposedFrame frame = MakeComposedFrame(it->second, !ready);
+            ComposedFrame frame = MakeComposedFrame(key, it->second, !ready);
             const std::string models = ResultModelsString(it->second.results);
             bool has_face = false;
             int face_boxes = 0;
@@ -424,6 +456,7 @@ void FrameResultAggregator::PublishAvailableLocked()
             auto cb = on_frame_ready_;
             RememberFinishedLocked(key);
             missing_since_.erase(key);
+            expected_models_.erase(key);
             pending_.erase(it);
             expected.second++;
 
@@ -436,14 +469,25 @@ void FrameResultAggregator::PublishAvailableLocked()
     }
 }
 
-bool FrameResultAggregator::HasRequiredResultsLocked(const FrameAggregate& agg) const
+const std::vector<ModelId>& FrameResultAggregator::ExpectedModelsLocked(const FrameKey& key) const
 {
-    if (required_models_.empty()) 
+    auto expected = expected_models_.find(key);
+    if (expected != expected_models_.end()) {
+        return expected->second;
+    }
+
+    return required_models_;
+}
+
+bool FrameResultAggregator::HasRequiredResultsLocked(const FrameKey& key, const FrameAggregate& agg) const
+{
+    const auto& required_models = ExpectedModelsLocked(key);
+    if (required_models.empty()) 
     {
         return true;
     }
 
-    for (const auto& required : required_models_) 
+    for (const auto& required : required_models) 
     {
         bool found = false;
 
@@ -465,14 +509,15 @@ bool FrameResultAggregator::HasRequiredResultsLocked(const FrameAggregate& agg) 
     return true;
 }
 
-ComposedFrame FrameResultAggregator::MakeComposedFrame(const FrameAggregate& agg, bool partial) const
+ComposedFrame FrameResultAggregator::MakeComposedFrame(const FrameKey& key, const FrameAggregate& agg, bool partial) const
 {
     ComposedFrame frame;
     frame.frame = agg.frame;
     frame.results = agg.results;
     frame.partial = partial;
 
-    for (const auto& required : required_models_) 
+    const auto& required_models = ExpectedModelsLocked(key);
+    for (const auto& required : required_models) 
     {
         bool found = false;
 

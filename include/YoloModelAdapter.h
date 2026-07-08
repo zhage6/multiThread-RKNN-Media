@@ -32,7 +32,8 @@ public:
 
     bool Submit(const FrameContext& frame, ModelOutputCallback cb) override
     {
-        if (!pool_) {
+        if (!pool_) 
+        {
             return false;
         }
 

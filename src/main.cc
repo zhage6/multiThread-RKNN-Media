@@ -38,11 +38,11 @@ int main(int argc, char **argv)
  
     // 初始化rknn线程池/Initialize the rknn thread pool
     std::atomic<int> active_channels{4};
-    int yoloThreadNum = 3;
-    int faceThreadNum = 6;
+    int yoloThreadNum = 4;
+    int faceThreadNum = 3;
     int in_flight_frames = 0;
-    rknnPool<rkYolov5s, input_data, InferOutput> testPool(yolo_model, yoloThreadNum, std::vector<int>{0});
-    rknnPool<rkYolov5s, input_data, InferOutput> facePool(face_model, faceThreadNum, std::vector<int>{1, 2});
+    rknnPool<rkYolov5s, input_data, InferOutput> testPool(yolo_model, yoloThreadNum, std::vector<int>{0,1});
+    rknnPool<rkYolov5s, input_data, InferOutput> facePool(face_model, faceThreadNum, std::vector<int>{2});
     if (testPool.init() != 0)
     {
         printf("rknnPool init fail!\n");
@@ -59,10 +59,11 @@ int main(int argc, char **argv)
     std::vector<std::shared_ptr<VideoChannel>> channels;
     FrameResultAggregator aggregator;
     MultiModelPipeline pipeline;
+    pipeline.SetAggregator(&aggregator);
     pipeline.AddModel(&yolo, 1);
     pipeline.AddModel(&face, 3);
     aggregator.SetRequiredModels({"yolo"});
-    aggregator.SetTimeout(std::chrono::milliseconds(240));
+    aggregator.SetTimeout(std::chrono::milliseconds(120));
     aggregator.SetOutputCallback([&mosaic, &channels](const ComposedFrame& frame) 
     {
         int ch = frame.frame.channel_id;

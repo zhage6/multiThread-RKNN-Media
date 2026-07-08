@@ -1,6 +1,7 @@
 #include "MosaicComposer.h"
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include "TimingLogger.h"
 #define MPP_ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 namespace 
@@ -41,6 +42,113 @@ namespace
         int unsupported = 0;
         int failed = 0;
     };
+
+    const uint8_t kDigitFont[10][7] = {
+        {0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e},
+        {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e},
+        {0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f},
+        {0x1e, 0x01, 0x01, 0x0e, 0x01, 0x01, 0x1e},
+        {0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02},
+        {0x1f, 0x10, 0x10, 0x1e, 0x01, 0x01, 0x1e},
+        {0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e},
+        {0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},
+        {0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e},
+        {0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c},
+    };
+
+    const uint8_t kColonFont[7] = {0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00};
+    const uint8_t kDotFont[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c};
+
+    void FillYRect(uint8_t* y_plane, int stride, int width, int height,
+                   int x, int y, int w, int h, uint8_t value)
+    {
+        const int left = clamp_to_range(x, 0, width);
+        const int top = clamp_to_range(y, 0, height);
+        const int right = clamp_to_range(x + w, left, width);
+        const int bottom = clamp_to_range(y + h, top, height);
+
+        for (int row = top; row < bottom; ++row) {
+            memset(y_plane + row * stride + left, value, right - left);
+        }
+    }
+
+    void DrawGlyphY(uint8_t* y_plane, int stride, int width, int height,
+                    int x, int y, const uint8_t glyph[7], int scale, uint8_t value)
+    {
+        for (int row = 0; row < 7; ++row) {
+            for (int col = 0; col < 5; ++col) {
+                if ((glyph[row] & (1 << (4 - col))) == 0) {
+                    continue;
+                }
+                FillYRect(y_plane, stride, width, height,
+                          x + col * scale,
+                          y + row * scale,
+                          scale,
+                          scale,
+                          value);
+            }
+        }
+    }
+
+    void DrawTextY(uint8_t* y_plane, int stride, int width, int height,
+                   int x, int y, const char* text, int scale)
+    {
+        if (!y_plane || !text || scale <= 0) {
+            return;
+        }
+
+        int len = static_cast<int>(strlen(text));
+        int text_w = len * 6 * scale + 2 * scale;
+        int text_h = 9 * scale;
+        FillYRect(y_plane, stride, width, height,
+                  x - scale,
+                  y - scale,
+                  text_w,
+                  text_h,
+                  32);
+
+        int cursor = x;
+        for (const char* p = text; *p; ++p) {
+            if (*p >= '0' && *p <= '9') {
+                DrawGlyphY(y_plane, stride, width, height,
+                           cursor, y, kDigitFont[*p - '0'], scale, 235);
+                cursor += 6 * scale;
+            } else if (*p == ':') {
+                DrawGlyphY(y_plane, stride, width, height,
+                           cursor, y, kColonFont, scale, 235);
+                cursor += 4 * scale;
+            } else if (*p == '.') {
+                DrawGlyphY(y_plane, stride, width, height,
+                           cursor, y, kDotFont, scale, 235);
+                cursor += 4 * scale;
+            } else {
+                cursor += 4 * scale;
+            }
+        }
+    }
+
+    void DrawWallClockOverlayNv12(void* ptr, int width, int height, int stride)
+    {
+        if (!ptr || width <= 0 || height <= 0 || stride <= 0) {
+            return;
+        }
+
+        auto now = std::chrono::system_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count() % 1000;
+        std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+        struct tm local_tm;
+        localtime_r(&now_time, &local_tm);
+
+        char text[32];
+        snprintf(text, sizeof(text), "%02d:%02d:%02d.%03lld",
+                 local_tm.tm_hour,
+                 local_tm.tm_min,
+                 local_tm.tm_sec,
+                 static_cast<long long>(ms));
+
+        DrawTextY(static_cast<uint8_t*>(ptr), stride, width, height, 24, 24, text, 4);
+    }
 } // namespace
 MosaicComposer::MosaicComposer()
     : out_width_(0),
@@ -638,6 +746,9 @@ void MosaicComposer::ComposeLocked()
         }
     }
     mosaic_compose_count_++;
+
+    void* dst_ptr = dst_info.ptr ? dst_info.ptr : mpp_buffer_get_ptr(dst_buffer);
+    DrawWallClockOverlayNv12(dst_ptr, out_width_, out_height_, out_hor_stride_);
 
     printf("Mosaic compose success: ch0=%llu ch1=%llu ch2=%llu ch3=%llu\n",
            static_cast<unsigned long long>(latest_[0].frame_id),

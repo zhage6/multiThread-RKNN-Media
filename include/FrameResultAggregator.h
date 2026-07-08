@@ -29,6 +29,7 @@ public:
     bool Start();
     void Stop();
 
+    void RegisterExpectedModels(const FrameContext& frame, std::vector<ModelId> models);
     bool Submit(ModelOutput output);
     void SkipFrame(int channel_id, uint64_t frame_id);
 
@@ -51,17 +52,19 @@ private:
     void PublishReadyLocked();
     void PublishTimeoutLocked();
     void PublishAvailableLocked();
-    bool HasRequiredResultsLocked(const FrameAggregate& agg) const;
-    ComposedFrame MakeComposedFrame(const FrameAggregate& agg, bool partial) const;
+    const std::vector<ModelId>& ExpectedModelsLocked(const FrameKey& key) const;
+    bool HasRequiredResultsLocked(const FrameKey& key, const FrameAggregate& agg) const;
+    ComposedFrame MakeComposedFrame(const FrameKey& key, const FrameAggregate& agg, bool partial) const;
 
 private:
     std::mutex mtx_;
     std::condition_variable cv_;
     std::deque<ModelOutput> queue_;
     std::map<FrameKey, FrameAggregate> pending_;//按 channel_id + frame_id 暂存同一帧的多个模型结果
-    std::map<int, uint64_t> expected_publish_frame_; // 每一路当前允许发布的 frame_id
+    std::map<int, uint64_t> expected_publish_frame_; // 每一路当前允许发布的 frame_id，前面是哪一路，后面是帧号
     std::map<int, uint64_t> max_seen_frame_;
     std::map<FrameKey, std::chrono::steady_clock::time_point> missing_since_;
+    std::map<FrameKey, std::vector<ModelId>> expected_models_;
 
     std::vector<ModelId> required_models_;
     AggregatedFrameCallback on_frame_ready_;

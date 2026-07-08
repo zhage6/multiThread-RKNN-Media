@@ -1,4 +1,7 @@
 #include <stdio.h>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <mutex>
 #include "rknn_api.h"
 #include "postprocess.h"
@@ -267,10 +270,35 @@ rknn_context *rkYolov5s::get_pctx()
  * @param dst_h        YOLO 模型的输入高度 (如 640)
  * @return int         0 表示成功，<0 表示失败
  */
-int process_rga_zero_copy(int src_fd, int src_w, int src_h, int src_w_stride, int src_h_stride,
-                          int dst_fd, int dst_w, int dst_h, int dst_w_stride, int dst_h_stride) 
+struct LetterboxInfo
 {
-// 1. 包装源内存 (MPP NV12)
+    BOX_RECT pads;
+    float scale;
+};
+
+int process_rga_zero_copy_letterbox(int src_fd, int src_w, int src_h, int src_w_stride, int src_h_stride,
+                                    int dst_fd, int dst_w, int dst_h, int dst_w_stride, int dst_h_stride,
+                                    LetterboxInfo *letterbox)
+{
+    if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 || letterbox == nullptr)
+    {
+        printf("RGA letterbox 参数非法: src=%dx%d dst=%dx%d\n", src_w, src_h, dst_w, dst_h);
+        return -1;
+    }
+
+    const float scale = std::min((float)dst_w / src_w, (float)dst_h / src_h);
+    int resize_w = (int)std::round(src_w * scale);
+    int resize_h = (int)std::round(src_h * scale);
+    resize_w = std::max(1, std::min(resize_w, dst_w));
+    resize_h = std::max(1, std::min(resize_h, dst_h));
+
+    letterbox->pads.left = (dst_w - resize_w) / 2;
+    letterbox->pads.right = dst_w - resize_w - letterbox->pads.left;
+    letterbox->pads.top = (dst_h - resize_h) / 2;
+    letterbox->pads.bottom = dst_h - resize_h - letterbox->pads.top;
+    letterbox->scale = scale;
+
+    // 1. 包装源内存 (MPP NV12)
     rga_buffer_t src_img = wrapbuffer_fd(src_fd, src_w, src_h, 
                                          RK_FORMAT_YCbCr_420_SP, 
                                          src_w_stride, src_h_stride);
@@ -280,13 +308,40 @@ int process_rga_zero_copy(int src_fd, int src_w, int src_h, int src_w_stride, in
                                          RK_FORMAT_RGB_888, 
                                          dst_w_stride, dst_h_stride);
 
-    // 3. 一键拉伸 + 转码！
-    // RGA 非常聪明，它会自动读取 src 和 dst 里面的宽高和格式，直接完成所有转换
-    
-    IM_STATUS status = imresize(src_img, dst_img);
-        
+    // 3. 先填充 letterbox 背景，再把等比例缩放后的图贴到有效区域。
+    im_rect full_rect;
+    full_rect.x = 0;
+    full_rect.y = 0;
+    full_rect.width = dst_w;
+    full_rect.height = dst_h;
+
+    IM_STATUS status = imfill(dst_img, full_rect, 0x00727272, IM_SYNC);
     if (status != IM_STATUS_SUCCESS) {
-        printf("RGA 硬件转换失败: %s\n", imStrError(status));
+        printf("RGA letterbox 填充失败: %s\n", imStrError(status));
+        return -1;
+    }
+
+    im_rect src_rect;
+    src_rect.x = 0;
+    src_rect.y = 0;
+    src_rect.width = src_w;
+    src_rect.height = src_h;
+
+    im_rect dst_rect;
+    dst_rect.x = letterbox->pads.left;
+    dst_rect.y = letterbox->pads.top;
+    dst_rect.width = resize_w;
+    dst_rect.height = resize_h;
+
+    im_rect empty_rect;
+    memset(&empty_rect, 0, sizeof(empty_rect));
+
+    rga_buffer_t pat;
+    memset(&pat, 0, sizeof(pat));
+
+    status = improcess(src_img, dst_img, pat, src_rect, dst_rect, empty_rect, IM_SYNC);
+    if (status != IM_STATUS_SUCCESS) {
+        printf("RGA letterbox 缩放转码失败: %s\n", imStrError(status));
         return -1;
     }
     return 0;
@@ -306,10 +361,13 @@ InferOutput rkYolov5s::infer(input_data data)
     // 2. 【核心 0 拷贝动作】：呼叫 RGA！
     // 将 MPP 的 YUV(src_fd) 直接转码缩放进我的 RGB(dst_fd) 专属模具里
     int dst_w_stride = input_attrs[0].w_stride > 0 ? input_attrs[0].w_stride : width;
+    LetterboxInfo letterbox;
+    memset(&letterbox, 0, sizeof(letterbox));
     auto rga_start = timing::Clock::now();
-    int rga_ret = process_rga_zero_copy(
+    int rga_ret = process_rga_zero_copy_letterbox(
         data.src_fd, data.width, data.height, data.hor_stride, data.ver_stride,
-        dst_fd, width, height, dst_w_stride, height // width 和 height 是 YOLO 模型的 640x640
+        dst_fd, width, height, dst_w_stride, height, // width 和 height 是 YOLO 模型的 640x640
+        &letterbox
     ); //相当于做了内存的不断覆盖
     auto rga_end = timing::Clock::now();
 
@@ -365,12 +423,9 @@ InferOutput rkYolov5s::infer(input_data data)
     ret = rknn_outputs_get(ctx, io_num.n_output, outputs, NULL);
     auto outputs_get_end = timing::Clock::now();
 
-    // 计算缩放比例 (模型输入大小 / 原始视频帧大小)
-    float scale_w = (float)width / data.width;
-    float scale_h = (float)height / data.height;
-
-    BOX_RECT pads;
-    memset(&pads, 0, sizeof(BOX_RECT)); // 你原代码没用 letterbox，pad 为 0
+    float scale_w = letterbox.scale;
+    float scale_h = letterbox.scale;
+    BOX_RECT pads = letterbox.pads;
 
     // 后处理/Post-processing
     //detect_result_group_t detect_result_group;

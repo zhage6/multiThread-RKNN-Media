@@ -54,7 +54,7 @@ VideoChannel::VideoChannel(int channel_id, const std::string& stream_url,
           m_last_packet_pts(-1),
           m_output_fps(24),
           m_throttle_local_input(is_local_stream_url(stream_url)),
-          m_input_fps(12),
+          m_input_fps(24),
           m_reorder_waiting(false),
           m_reorder_timeout(std::chrono::milliseconds(120)),
           m_reorder_drop_count(0),
@@ -256,7 +256,8 @@ void VideoChannel::ProcessModelOutput(const ModelOutput& output)
                 static_cast<unsigned long long>(frame_id),
                 output.result.detections.count);
 
-    if (frame_id < m_expected_frame_id) {
+    if (frame_id < m_expected_frame_id) 
+    {
         if (m_reorder_skipped_frames.count(frame_id)) {
             timing::Log("model_reorder_skipped_drop model=%s ch=%d frame=%llu expected=%llu boxes=%d",
                         output.result.model_id.c_str(),

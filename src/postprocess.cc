@@ -332,6 +332,8 @@ int post_process(int8_t *input0, int8_t *input1, int8_t *input2, int model_in_h,
 
   int last_count = 0;
   group->count = 0;
+  int content_w = model_in_w - pads.left - pads.right;
+  int content_h = model_in_h - pads.top - pads.bottom;
   /* box valid detect target */
   for (int i = 0; i < validCount; ++i)
   {
@@ -348,10 +350,10 @@ int post_process(int8_t *input0, int8_t *input1, int8_t *input2, int model_in_h,
     int id = classId[n];
     float obj_conf = objProbs[i];
 
-    group->results[last_count].box.left = (int)(clamp(x1, 0, model_in_w) / scale_w);
-    group->results[last_count].box.top = (int)(clamp(y1, 0, model_in_h) / scale_h);
-    group->results[last_count].box.right = (int)(clamp(x2, 0, model_in_w) / scale_w);
-    group->results[last_count].box.bottom = (int)(clamp(y2, 0, model_in_h) / scale_h);
+    group->results[last_count].box.left = (int)(clamp(x1, 0, content_w) / scale_w);
+    group->results[last_count].box.top = (int)(clamp(y1, 0, content_h) / scale_h);
+    group->results[last_count].box.right = (int)(clamp(x2, 0, content_w) / scale_w);
+    group->results[last_count].box.bottom = (int)(clamp(y2, 0, content_h) / scale_h);
     group->results[last_count].prop = obj_conf;
     char *label = labels[id];
     strncpy(group->results[last_count].name, label, OBJ_NAME_MAX_SIZE);
@@ -392,6 +394,8 @@ static void fill_face_result_group(std::vector<face_candidate_t> &candidates, in
 
   std::vector<int> suppressed(candidates.size(), 0);
   int last_count = 0;
+  int content_w = model_in_w - pads.left - pads.right;
+  int content_h = model_in_h - pads.top - pads.bottom;
 
   for (size_t i = 0; i < candidates.size(); ++i)
   {
@@ -408,10 +412,10 @@ static void fill_face_result_group(std::vector<face_candidate_t> &candidates, in
     float y2 = candidate.y2 - pads.top;
 
     detect_result_t &result = group->results[last_count];
-    result.box.left = (int)(clamp(x1, 0, model_in_w) / scale_w);
-    result.box.top = (int)(clamp(y1, 0, model_in_h) / scale_h);
-    result.box.right = (int)(clamp(x2, 0, model_in_w) / scale_w);
-    result.box.bottom = (int)(clamp(y2, 0, model_in_h) / scale_h);
+    result.box.left = (int)(clamp(x1, 0, content_w) / scale_w);
+    result.box.top = (int)(clamp(y1, 0, content_h) / scale_h);
+    result.box.right = (int)(clamp(x2, 0, content_w) / scale_w);
+    result.box.bottom = (int)(clamp(y2, 0, content_h) / scale_h);
     result.prop = candidate.score;
     result.has_landmarks = 1;
     strncpy(result.name, "face", OBJ_NAME_MAX_SIZE - 1);
@@ -421,8 +425,8 @@ static void fill_face_result_group(std::vector<face_candidate_t> &candidates, in
     {
       float landmark_x = candidate.landmarks[k][0] - pads.left;
       float landmark_y = candidate.landmarks[k][1] - pads.top;
-      result.landmarks[k][0] = (int)(clamp(landmark_x, 0, model_in_w) / scale_w);
-      result.landmarks[k][1] = (int)(clamp(landmark_y, 0, model_in_h) / scale_h);
+      result.landmarks[k][0] = (int)(clamp(landmark_x, 0, content_w) / scale_w);
+      result.landmarks[k][1] = (int)(clamp(landmark_y, 0, content_h) / scale_h);
     }
 
     last_count++;
