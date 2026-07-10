@@ -383,6 +383,7 @@ InferOutput rkYolov5s::infer(input_data data)
     out.channel_id = data.channel_id; // 贴上通道标签
     out.frame_id = data.frame_id;     // 贴上序号标签
     out.pts_us = data.pts_us;
+    out.origin_wall_ms = data.origin_wall_ms;
     out.src_buffer = data.src_buffer;
     out.src_fd = data.src_fd;
     out.width = data.width;

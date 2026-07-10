@@ -231,8 +231,10 @@ void MppDecoder::FlushDecoder()
             else if (mpp_frame_get_errinfo(frame) == 0 && mpp_frame_get_discard(frame) == 0) 
             {
                 int src_fd = mpp_buffer_get_fd(mpp_frame_get_buffer(frame));
-                if (m_callback) {
-                    m_callback(src_fd, m_src_width, m_src_height, m_hor_stride, m_ver_stride, frame);
+                int64_t pts_us = mpp_frame_get_pts(frame);
+                if (m_callback) 
+                {
+                    m_callback(src_fd, m_src_width, m_src_height, m_hor_stride, m_ver_stride, pts_us, frame);
                 }
 
                 // The callback must keep the decoded image alive with
@@ -242,10 +244,6 @@ void MppDecoder::FlushDecoder()
                 mpp_frame_deinit(&frame);
                 frame = nullptr;
             }
-
-            // // 归还帧引用
-            // mpp_frame_deinit(&frame); //不能立马释放
-            // frame = nullptr;
             else 
             {
                 mpp_frame_deinit(&frame); // 废废帧当场释放

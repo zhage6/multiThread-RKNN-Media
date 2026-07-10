@@ -24,6 +24,7 @@ struct input_data
     int channel_id;      // 标记是哪一路视频
     uint64_t frame_id;   // 标记这路视频的第几帧 (用来排序)
     int64_t pts_us = -1; // 预留媒体时间戳，当前没有真实 PTS 时保持 -1
+    int64_t origin_wall_ms = -1; // 这帧进入处理管线时的系统时间，用于端到端延迟测量
 
 };
 
@@ -33,6 +34,7 @@ struct InferOutput
     int channel_id;      // 标记是哪一路视频
     uint64_t frame_id;   // 标记这路视频的第几帧 (用来排序)
     int64_t pts_us = -1; // 预留媒体时间戳，当前没有真实 PTS 时保持 -1
+    int64_t origin_wall_ms = -1; // 从输入一路传到输出，用于画面端到端延迟测量
     MppBuffer src_buffer; // 原始解码 DMA buffer，编码前由 RGA 读取
     int src_fd;
     int width;

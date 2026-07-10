@@ -36,6 +36,12 @@ namespace
                url.rfind("http://", 0) != 0 &&
                url.rfind("https://", 0) != 0;
     }
+
+    int64_t current_wall_ms()
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
 } // namespace
 
 VideoChannel::VideoChannel(int channel_id, const std::string& stream_url, 
@@ -100,7 +106,7 @@ void VideoChannel::start()
                         m_input_fps,
                         m_stream_url.c_str());
         }
-        m_decoder->Init([this](int src_fd, int w, int h, int h_stride, int v_stride, MppFrame frame) 
+        m_decoder->Init([this](int src_fd, int w, int h, int h_stride, int v_stride, int64_t pts_us, MppFrame frame) 
         {
             // 当这个通道的 MPP 解出一帧时，会触发这里
             input_data data;
@@ -124,8 +130,12 @@ void VideoChannel::start()
             data.frame = nullptr;
             data.channel_id = this->m_channel_id;    // 贴上通道标签
             data.frame_id = this->m_frame_counter++; // 贴上序号标签(满了怎么办？)
-            data.pts_us = -1;                        // 当前阶段没有真实 PTS，先保留字段
+            data.pts_us = pts_us;                        // 当前阶段没有真实 PTS，先保留字段
 
+            if (data.pts_us <= 0 && this->m_input_fps > 0) 
+            {
+                data.pts_us = static_cast<int64_t>(data.frame_id) * 1000000 / this->m_input_fps;
+            }
             if (this->m_throttle_local_input && this->m_input_fps > 0) {
                 auto target_time = this->m_input_start_time +
                     std::chrono::microseconds(data.frame_id * 1000000 / this->m_input_fps);
@@ -172,6 +182,7 @@ void VideoChannel::start()
             task_frame.channel_id = data.channel_id;
             task_frame.frame_id = data.frame_id;
             task_frame.pts_us = data.pts_us;
+            task_frame.origin_wall_ms = current_wall_ms();
             task_frame.src_fd = data.src_fd;
             task_frame.src_buffer = data.src_buffer;
             task_frame.width = data.width;
@@ -192,9 +203,10 @@ void VideoChannel::start()
                 return;
             }
 
-            timing::Log("decode_enqueue ch=%d frame=%llu inflight=%d max_inflight=%d queue=%zu",
+            timing::Log("decode_enqueue ch=%d frame=%llu pts_us=%lld inflight=%d max_inflight=%d queue=%zu",
                         this->m_channel_id,
                         static_cast<unsigned long long>(task_frame.frame_id),
+                        static_cast<long long>(task_frame.pts_us),
                         inflight_after,
                         max_inflight,
                         this->m_pipeline->PendingCount());

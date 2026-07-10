@@ -15,6 +15,7 @@ struct FrameContext
     int channel_id = -1;
     uint64_t frame_id = 0;
     int64_t pts_us = -1;
+    int64_t origin_wall_ms = -1;
 
     int src_fd = -1;
     MppBuffer src_buffer = nullptr;
@@ -88,6 +89,7 @@ inline ComposedFrame MakeYoloComposedFrame(const InferOutput& out)
     composed.frame.channel_id = out.channel_id;
     composed.frame.frame_id = out.frame_id;
     composed.frame.pts_us = out.pts_us;
+    composed.frame.origin_wall_ms = out.origin_wall_ms;
     composed.frame.src_fd = out.src_fd;
     composed.frame.src_buffer = out.src_buffer;
     composed.frame.width = out.width;

@@ -29,6 +29,7 @@ struct MosaicInput
     int channel_id = -1;
     uint64_t frame_id = 0;
     int64_t pts_us = -1;
+    int64_t origin_wall_ms = -1;
 
     MppBuffer src_buffer = nullptr;
     int src_fd = -1;
@@ -71,8 +72,16 @@ private:
     static constexpr int kChannels = 4; //固定四路输入
     bool AllocateOutputBuffers(int count);
     void ReleaseOutputBuffers();
+    bool SelectSyncedInputsLocked(int64_t target_pts_us,std::array<MosaicInput, kChannels>& selected);
     std::mutex mtx_;
     std::array<MosaicInput, kChannels> latest_;
+
+    std::array<std::map<int64_t, MosaicInput>, kChannels> pts_buffers_; //缓存到达的帧
+    std::array<MosaicInput, kChannels> last_synced_; //缓存发出的上一帧
+
+    int64_t next_mosaic_pts_us_ = -1;//当前要拼的媒体时间点
+    int64_t mosaic_period_us_ = 0; //拼接周期
+    int64_t sync_tolerance_us_ = 0; //允许某一路帧和 target_pts_us 差多少
 
     std::unique_ptr<RkMppEncoder> encoder_;
     std::unique_ptr<StreamPublisher> publisher_;

@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <vector>
 #include "TimingLogger.h"
 #define MPP_ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 namespace 
@@ -43,7 +44,15 @@ namespace
         int failed = 0;
     };
 
-    const uint8_t kDigitFont[10][7] = {
+    struct RenderBatch
+    {
+        std::vector<im_rect> yolo_boxes;
+        std::vector<im_rect> face_boxes;
+        std::vector<im_rect> landmarks;
+    };
+
+    const uint8_t kDigitFont[10][7] = 
+    {
         {0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e},
         {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e},
         {0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f},
@@ -127,27 +136,74 @@ namespace
         }
     }
 
-    void DrawWallClockOverlayNv12(void* ptr, int width, int height, int stride)
+    int64_t CurrentWallMs()
     {
-        if (!ptr || width <= 0 || height <= 0 || stride <= 0) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    int TextWidth(const char* text, int scale)
+    {
+        if (!text || scale <= 0) {
+            return 0;
+        }
+
+        int width = 2 * scale;
+        for (const char* p = text; *p; ++p) {
+            if (*p >= '0' && *p <= '9') {
+                width += 6 * scale;
+            } else if (*p == ':' || *p == '.') {
+                width += 4 * scale;
+            } else {
+                width += 4 * scale;
+            }
+        }
+        return width;
+    }
+
+    void FormatWallClockText(int64_t wall_ms, char* text, size_t text_size)
+    {
+        if (!text || text_size == 0 || wall_ms < 0) {
             return;
         }
 
-        auto now = std::chrono::system_clock::now();
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now.time_since_epoch()).count() % 1000;
-        std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+        auto ms = wall_ms % 1000;
+        std::time_t wall_time = static_cast<std::time_t>(wall_ms / 1000);
         struct tm local_tm;
-        localtime_r(&now_time, &local_tm);
+        localtime_r(&wall_time, &local_tm);
 
-        char text[32];
-        snprintf(text, sizeof(text), "%02d:%02d:%02d.%03lld",
+        snprintf(text, text_size, "%02d:%02d:%02d.%03lld",
                  local_tm.tm_hour,
                  local_tm.tm_min,
                  local_tm.tm_sec,
                  static_cast<long long>(ms));
+    }
 
-        DrawTextY(static_cast<uint8_t*>(ptr), stride, width, height, 24, 24, text, 4);
+    void DrawWallClockOverlayNv12(void* ptr, int width, int height, int stride,
+                                  int x, int y, int64_t wall_ms)
+    {
+        if (!ptr || width <= 0 || height <= 0 || stride <= 0 || wall_ms < 0) {
+            return;
+        }
+
+        char text[32];
+        FormatWallClockText(wall_ms, text, sizeof(text));
+
+        DrawTextY(static_cast<uint8_t*>(ptr), stride, width, height, x, y, text, 4);
+    }
+
+    void DrawWallClockRightOverlayNv12(void* ptr, int width, int height, int stride,
+                                       int y, int64_t wall_ms)
+    {
+        if (!ptr || width <= 0 || height <= 0 || stride <= 0 || wall_ms < 0) {
+            return;
+        }
+
+        char text[32];
+        FormatWallClockText(wall_ms, text, sizeof(text));
+        const int scale = 4;
+        const int x = std::max(4, width - TextWidth(text, scale) - 24);
+        DrawTextY(static_cast<uint8_t*>(ptr), stride, width, height, x, y, text, scale);
     }
 } // namespace
 MosaicComposer::MosaicComposer()
@@ -172,10 +228,17 @@ bool MosaicComposer::Init(int out_width, int out_height, int fps)
     out_width_ = out_width;
     out_height_ = out_height;
     fps_ = fps;
+    mosaic_period_us_ = 1000000 / std::max(1, fps_);
+    sync_tolerance_us_ = mosaic_period_us_;
+    next_mosaic_pts_us_ = -1;
     initialized_ = true;
     out_hor_stride_ = MPP_ALIGN(out_width_, 16);
     out_ver_stride_ = MPP_ALIGN(out_height_, 16);
     out_buf_size_ = out_hor_stride_ * out_ver_stride_ * 3 / 2;
+    for (auto& buffer : pts_buffers_) 
+    {
+        buffer.clear();
+    }
     if (!AllocateOutputBuffers(4)) 
     {
         initialized_ = false;
@@ -385,6 +448,7 @@ void MosaicComposer::ReleaseInput(MosaicInput& input)
     input.channel_id = -1;
     input.frame_id = 0;
     input.pts_us = -1;
+    input.origin_wall_ms = -1;
     input.valid = false;
 
     memset(&input.results, 0, sizeof(input.results));
@@ -393,15 +457,110 @@ void MosaicComposer::ReleaseInput(MosaicInput& input)
 
 bool MosaicComposer::ReadyLocked() const
 {
-    for (const auto& input : latest_) 
-    {
-        if (!input.valid) {
+    for (int ch = 0; ch < kChannels; ++ch) {
+        if (pts_buffers_[ch].empty() && !last_synced_[ch].valid) 
+        {
             return false;
         }
     }
     return true;
 }
+bool MosaicComposer::SelectSyncedInputsLocked(int64_t target_pts_us,std::array<MosaicInput, kChannels>& selected)
+    {
+        for (int ch = 0; ch < kChannels; ++ch) 
+        {
+            auto& buffer = pts_buffers_[ch];
 
+            if (buffer.empty()) 
+            {
+                if (last_synced_[ch].valid) 
+                {
+                    selected[ch] = last_synced_[ch];
+                    if (selected[ch].src_buffer) 
+                    {
+                        mpp_buffer_inc_ref(selected[ch].src_buffer);
+                    }
+                    continue;
+                }
+                return false;
+            }
+
+            auto best = buffer.lower_bound(target_pts_us);
+
+            auto candidate = buffer.end();
+
+            if (best == buffer.begin()) 
+            {
+                candidate = best;
+            } 
+            else if (best == buffer.end()) 
+            {
+                candidate = std::prev(buffer.end());
+            } 
+            else 
+            {
+                auto prev = std::prev(best);
+
+                int64_t d1 = std::llabs(best->first - target_pts_us);
+                int64_t d0 = std::llabs(prev->first - target_pts_us);
+
+                candidate = (d1 < d0) ? best : prev;
+            }
+
+            if (candidate == buffer.end()) 
+            {
+                if (last_synced_[ch].valid) 
+                {
+                    selected[ch] = last_synced_[ch];
+                    if(selected[ch].src_buffer) 
+                    {
+                        mpp_buffer_inc_ref(selected[ch].src_buffer);
+                    }
+                    continue;
+                }
+                return false;
+            }
+
+            int64_t diff = std::llabs(candidate->first - target_pts_us);
+
+            if (diff > sync_tolerance_us_) 
+            {
+                if (last_synced_[ch].valid) 
+                {
+                    selected[ch] = last_synced_[ch];
+                    if (selected[ch].src_buffer) 
+                    {
+                        mpp_buffer_inc_ref(selected[ch].src_buffer);
+                    }
+                    continue;
+                }
+                return false;
+            }
+
+            selected[ch] = candidate->second;
+
+            if (selected[ch].src_buffer) {
+                mpp_buffer_inc_ref(selected[ch].src_buffer);
+            }
+
+            if (last_synced_[ch].valid) {
+                ReleaseInput(last_synced_[ch]);
+            }
+
+            last_synced_[ch] = candidate->second;
+            if (last_synced_[ch].src_buffer) {
+                mpp_buffer_inc_ref(last_synced_[ch].src_buffer);
+            }
+
+            auto erase_end = std::next(candidate);
+            for (auto it = buffer.begin(); it != erase_end; ) {
+                ReleaseInput(it->second);
+                it = buffer.erase(it);
+            }
+        }
+
+    return true;
+}
 
 
 void MosaicComposer::Submit(const InferOutput& out)
@@ -415,7 +574,8 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
 
     if (ctx.channel_id < 0 || ctx.channel_id >= kChannels) 
     {
-        if (ctx.src_buffer) {
+        if (ctx.src_buffer) 
+        {
             mpp_buffer_put(ctx.src_buffer);
         }
         return;
@@ -432,8 +592,8 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
     }
 
     MosaicInput& slot = latest_[ctx.channel_id];
-
-    if (slot.valid) {
+    if (slot.valid) 
+    {
         ReleaseInput(slot);
     }
 
@@ -441,6 +601,7 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
     slot.channel_id = ctx.channel_id;
     slot.frame_id = ctx.frame_id;
     slot.pts_us = ctx.pts_us;
+    slot.origin_wall_ms = ctx.origin_wall_ms;
     slot.src_buffer = ctx.src_buffer;
     slot.src_fd = ctx.src_fd;
     slot.width = ctx.width;
@@ -451,13 +612,14 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
 
     for (const auto& result : frame.results) {
         if (result.ok && result.model_id == "face_yolo") {
-            reusable_model_results_[ctx.channel_id][result.model_id] = result;
+            reusable_model_results_[ctx.channel_id][result.model_id] = result; //缓存face_yolo结果，以便后续帧复用
         }
     }
 
     bool has_face_result = false;
     for (const auto& result : slot.model_results) {
-        if (result.model_id == "face_yolo") {
+        if (result.model_id == "face_yolo") 
+        {
             has_face_result = true;
             break;
         }
@@ -481,9 +643,10 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
             yolo_boxes = result.detections.count;
         }
     }
-    timing::Log("mosaic_submit ch=%d frame=%llu partial=%d results=%zu has_face=%d face_boxes=%d yolo_boxes=%d",
+    timing::Log("mosaic_submit ch=%d frame=%llu pts_us=%lld partial=%d results=%zu has_face=%d face_boxes=%d yolo_boxes=%d",
                 ctx.channel_id,
                 static_cast<unsigned long long>(ctx.frame_id),
+                static_cast<long long>(ctx.pts_us),
                 frame.partial ? 1 : 0,
                 frame.results.size(),
                 has_face ? 1 : 0,
@@ -491,6 +654,8 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
                 yolo_boxes);
 
     // 先兼容 YOLO：从 composed results 里找 Detection 结果
+
+    
     memset(&slot.results, 0, sizeof(slot.results));
     for (const auto& result : frame.results) {
         if (result.type == ModelResultType::Detection && result.ok) {
@@ -498,6 +663,33 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
             break;
         }
     }
+     if (ctx.pts_us >= 0)
+    {
+        MosaicInput buffered = slot;
+        if (buffered.src_buffer) 
+        {
+            mpp_buffer_inc_ref(buffered.src_buffer);
+        }
+
+        auto& buffer = pts_buffers_[ctx.channel_id];
+
+        auto old = buffer.find(ctx.pts_us);
+        if (old != buffer.end()) {
+            ReleaseInput(old->second);
+            old->second = buffered;
+        } 
+        else
+        {
+            buffer.emplace(ctx.pts_us, buffered);
+        }
+
+        while (buffer.size() > 8) 
+        {
+            ReleaseInput(buffer.begin()->second); 
+            buffer.erase(buffer.begin());
+        }
+    }
+
 
     MaybeLogStatsLocked("submit");
 }
@@ -537,7 +729,7 @@ void MosaicComposer::FlowLoop()
 RenderStats RenderModelResult(const ModelResult& result,
                        const MosaicInput& input,
                        const im_rect& dst_rect,
-                       rga_buffer_t dst_img,
+                       RenderBatch& batch,
                        int channel_index)
 {
     RenderStats stats;
@@ -551,7 +743,9 @@ RenderStats RenderModelResult(const ModelResult& result,
     {
     case ModelResultType::Detection:
     {
-        const int box_color = (result.model_id == "face_yolo") ? 0x000000ff : 0x0000ff00;
+        auto& box_batch = (result.model_id == "face_yolo")
+                            ? batch.face_boxes
+                            : batch.yolo_boxes;
         const float scale_x = static_cast<float>(dst_rect.width) / input.width;
         const float scale_y = static_cast<float>(dst_rect.height) / input.height;
 
@@ -584,13 +778,7 @@ RenderStats RenderModelResult(const ModelResult& result,
             rect.y = top;
             rect.width = right - left;
             rect.height = bottom - top;
-
-            IM_STATUS rect_status = imrectangle(dst_img, rect, box_color, 4);
-            if (rect_status != IM_STATUS_SUCCESS) 
-            {
-                printf("Mosaic draw box failed ch=%d box=%d status=%d\n",
-                       channel_index, j, rect_status);
-            }
+            box_batch.push_back(rect);
 
             if (res.has_landmarks) {
                 for (int k = 0; k < FACE_LANDMARK_NUM; ++k) {
@@ -605,16 +793,11 @@ RenderStats RenderModelResult(const ModelResult& result,
                     point.y = align_down_even(clamp_to_range(center_y - 2, cell_top, cell_bottom - 4));
                     point.width = 4;
                     point.height = 4;
-
-                    IM_STATUS point_status = imfill(dst_img, point, 0x00ff0000);
-                    if (point_status != IM_STATUS_SUCCESS) {
-                        printf("Mosaic draw landmark failed ch=%d box=%d point=%d status=%d\n",
-                               channel_index, j, k, point_status);
-                    }
+                    batch.landmarks.push_back(point);
                 }
             }
         }
-        stats.boxes++;
+        stats.boxes += result.detections.count;
         if (result.model_id == "face_yolo" && result.detections.count > 0) 
         {
             timing::Log("mosaic_render_face ch=%d frame=%llu boxes=%d",
@@ -639,17 +822,96 @@ RenderStats RenderModelResult(const ModelResult& result,
 
 void MosaicComposer::ComposeLocked()
 {
+    constexpr bool kDrawDetections = true;
+    constexpr bool kDrawTimestamps = false;
     if (!ReadyLocked()) {
         mosaic_not_ready_count_++;
         MaybeLogStatsLocked("mosaic_not_ready");
         return;
     }
+      // 1. 初始化 next_mosaic_pts_us_
+    if (next_mosaic_pts_us_ < 0) 
+    {
+        int64_t max_first_pts = -1;
+
+        for (int ch = 0; ch < kChannels; ++ch) //确定要发布的帧的pts，取各通道最小的 pts 的最大值
+        {
+            if (pts_buffers_[ch].empty()) 
+            {
+                mosaic_not_ready_count_++;
+                MaybeLogStatsLocked("pts_not_ready");
+                return;
+            }
+
+            max_first_pts = std::max(max_first_pts, pts_buffers_[ch].begin()->first); 
+        }
+
+        next_mosaic_pts_us_ = max_first_pts;
+    }
+    int64_t oldest_common_pts = -1;
+    bool all_channels_have_buffer = true;
+
+    for (int ch = 0; ch < kChannels; ++ch)
+    {
+        if (pts_buffers_[ch].empty())
+        {
+            all_channels_have_buffer = false;
+            break;
+        }
+
+        // begin() 是当前通道仍然保存的最旧 PTS。
+        oldest_common_pts =
+            std::max(oldest_common_pts,
+                    pts_buffers_[ch].begin()->first);
+    }
+
+    if (all_channels_have_buffer &&
+        next_mosaic_pts_us_ <
+            oldest_common_pts - sync_tolerance_us_)
+    {
+        const int64_t old_target_pts = next_mosaic_pts_us_;
+
+        // 旧目标已经无法从所有通道中找到，直接追到公共可用窗口。
+        next_mosaic_pts_us_ = oldest_common_pts;
+
+        timing::Log(
+            "mosaic_pts_catchup old_target=%lld new_target=%lld lag_us=%lld",
+            static_cast<long long>(old_target_pts),
+            static_cast<long long>(next_mosaic_pts_us_),
+            static_cast<long long>(
+                next_mosaic_pts_us_ - old_target_pts));
+    }
+
+    // 2. 一张 mosaic 只选一次
+    std::array<MosaicInput, kChannels> selected;
+    for (auto& item : selected) 
+    {
+        item.valid = false;
+    }
+
+    const int64_t target_pts_us = next_mosaic_pts_us_;
+
+    if (!SelectSyncedInputsLocked(target_pts_us, selected)) 
+    {
+        for (auto& input : selected) 
+        {
+            ReleaseInput(input);
+        }
+        mosaic_not_ready_count_++;
+        MaybeLogStatsLocked("pts_select_not_ready");
+        return;
+    }
+    next_mosaic_pts_us_ += mosaic_period_us_;
 
     MppBuffer dst_buffer = nullptr;
     MPP_RET ret = mpp_buffer_get(mosaic_grp_, &dst_buffer, out_buf_size_);
 
     if (ret != MPP_OK || dst_buffer == nullptr) 
     {
+        for (auto& input : selected) 
+        {
+            ReleaseInput(input);
+        }
         printf("Mosaic output buffer busy, drop one mosaic frame ret=%d\n", ret);
         mosaic_busy_drop_count_++;
         MaybeLogStatsLocked("mosaic_busy");
@@ -658,8 +920,12 @@ void MosaicComposer::ComposeLocked()
 
     MppBufferInfo dst_info;
     memset(&dst_info, 0, sizeof(dst_info));
-    if (mpp_buffer_info_get(dst_buffer, &dst_info) != MPP_OK || dst_info.fd < 0) 
+    if (mpp_buffer_info_get(dst_buffer, &dst_info) != MPP_OK || dst_info.fd < 0) //申请内存
     {
+        for (auto& input : selected) 
+        {
+            ReleaseInput(input);
+        }
         printf("Mosaic mpp_buffer_info_get failed\n");
         mpp_buffer_put(dst_buffer);
         mosaic_busy_drop_count_++;
@@ -672,10 +938,18 @@ void MosaicComposer::ComposeLocked()
 
     const int cell_w = out_width_ / 2;
     const int cell_h = out_height_ / 2;
+    rga_buffer_t dst_img = wrapbuffer_fd(dst_fd,
+                                 out_width_,
+                                 out_height_,
+                                 RK_FORMAT_YCbCr_420_SP,
+                                 out_hor_stride_,
+                                 out_ver_stride_);
+    RenderBatch render_batch;
 
     for (int i = 0; i < kChannels; ++i) 
     {
-        auto& input = latest_[i];
+        auto& input = selected[i];
+        
 
         rga_buffer_t src = wrapbuffer_fd(input.src_fd,
                                  input.width,
@@ -684,13 +958,6 @@ void MosaicComposer::ComposeLocked()
                                  input.hor_stride,
                                  input.ver_stride);
 
-
-        rga_buffer_t dst_img = wrapbuffer_fd(dst_fd,
-                                     out_width_,
-                                     out_height_,
-                                     RK_FORMAT_YCbCr_420_SP,
-                                     out_hor_stride_,
-                                     out_ver_stride_);
 
         im_rect src_rect;
         src_rect.x = 0;
@@ -723,13 +990,13 @@ void MosaicComposer::ComposeLocked()
             printf("Mosaic RGA failed ch=%d status=%d\n", i, status);
             mosaic_rga_fail_count_++;
         }
-        if (status == IM_STATUS_SUCCESS) 
+        if (status == IM_STATUS_SUCCESS && kDrawDetections) 
         {
             if (!input.model_results.empty()) 
             {
                 for (const auto& result : input.model_results) 
                 {
-                    RenderModelResult(result, input, dst_rect, dst_img, i);
+                    RenderModelResult(result, input, dst_rect, render_batch, i);
                 }
             } 
             else 
@@ -741,20 +1008,112 @@ void MosaicComposer::ComposeLocked()
                 legacy.ok = true;
                 legacy.detections = input.results;
 
-                RenderModelResult(legacy, input, dst_rect, dst_img, i);
+                RenderModelResult(legacy, input, dst_rect, render_batch, i);
+            }
+        }
+    }
+
+    if (kDrawDetections)
+    {
+        if (!render_batch.yolo_boxes.empty())
+        {
+            IM_STATUS status = imrectangleArray(dst_img,
+                                                 render_batch.yolo_boxes.data(),
+                                                 static_cast<int>(render_batch.yolo_boxes.size()),
+                                                 0x0000ff00,
+                                                 4);
+            if (status != IM_STATUS_SUCCESS)
+            {
+                printf("Mosaic batch draw YOLO boxes failed count=%zu status=%d\n",
+                       render_batch.yolo_boxes.size(), status);
+                mosaic_rga_fail_count_++;
+            }
+        }
+
+        if (!render_batch.face_boxes.empty())
+        {
+            IM_STATUS status = imrectangleArray(dst_img,
+                                                 render_batch.face_boxes.data(),
+                                                 static_cast<int>(render_batch.face_boxes.size()),
+                                                 0x000000ff,
+                                                 4);
+            if (status != IM_STATUS_SUCCESS)
+            {
+                printf("Mosaic batch draw face boxes failed count=%zu status=%d\n",
+                       render_batch.face_boxes.size(), status);
+                mosaic_rga_fail_count_++;
+            }
+        }
+
+        if (!render_batch.landmarks.empty())
+        {
+            IM_STATUS status = imfillArray(dst_img,
+                                            render_batch.landmarks.data(),
+                                            static_cast<int>(render_batch.landmarks.size()),
+                                            0x00ff0000);
+            if (status != IM_STATUS_SUCCESS)
+            {
+                printf("Mosaic batch draw landmarks failed count=%zu status=%d\n",
+                       render_batch.landmarks.size(), status);
+                mosaic_rga_fail_count_++;
             }
         }
     }
     mosaic_compose_count_++;
+    if (kDrawTimestamps) 
+    {
+        void* dst_ptr = dst_info.ptr ? dst_info.ptr : mpp_buffer_get_ptr(dst_buffer);
+        const int64_t compose_wall_ms = CurrentWallMs();
+        DrawWallClockRightOverlayNv12(dst_ptr,
+                                    out_width_,
+                                    out_height_,
+                                    out_hor_stride_,
+                                    24,
+                                    compose_wall_ms);
+        int64_t age_ms[kChannels];
+        for (int i = 0; i < kChannels; ++i) 
+        {
+            const auto& input = selected[i];
+            const int overlay_x = (i % 2) * cell_w + 24;
+            const int overlay_y = (i / 2) * cell_h + 24;
+            DrawWallClockOverlayNv12(dst_ptr,
+                                    out_width_,
+                                    out_height_,
+                                    out_hor_stride_,
+                                    overlay_x,
+                                    overlay_y,
+                                    input.origin_wall_ms);
+            age_ms[i] = input.origin_wall_ms >= 0 ? compose_wall_ms - input.origin_wall_ms : -1;
+        }
+            timing::Log("mosaic_e2e_age_ms ch0=%lld ch1=%lld ch2=%lld ch3=%lld frame=%llu,%llu,%llu,%llu",
+                static_cast<long long>(age_ms[0]),
+                static_cast<long long>(age_ms[1]),
+                static_cast<long long>(age_ms[2]),
+                static_cast<long long>(age_ms[3]),
+                static_cast<unsigned long long>(selected[0].frame_id),
+                static_cast<unsigned long long>(selected[1].frame_id),
+                static_cast<unsigned long long>(selected[2].frame_id),
+                static_cast<unsigned long long>(selected[3].frame_id));
+    }
+    
 
-    void* dst_ptr = dst_info.ptr ? dst_info.ptr : mpp_buffer_get_ptr(dst_buffer);
-    DrawWallClockOverlayNv12(dst_ptr, out_width_, out_height_, out_hor_stride_);
 
     printf("Mosaic compose success: ch0=%llu ch1=%llu ch2=%llu ch3=%llu\n",
-           static_cast<unsigned long long>(latest_[0].frame_id),
-           static_cast<unsigned long long>(latest_[1].frame_id),
-           static_cast<unsigned long long>(latest_[2].frame_id),
-           static_cast<unsigned long long>(latest_[3].frame_id));
+           static_cast<unsigned long long>(selected[0].frame_id),
+           static_cast<unsigned long long>(selected[1].frame_id),
+           static_cast<unsigned long long>(selected[2].frame_id),
+           static_cast<unsigned long long>(selected[3].frame_id));
+
+    timing::Log("mosaic_pts_select target_pts=%lld selected_pts=%lld,%lld,%lld,%lld selected_frame=%llu,%llu,%llu,%llu",
+            static_cast<long long>(target_pts_us),
+            static_cast<long long>(selected[0].pts_us),
+            static_cast<long long>(selected[1].pts_us),
+            static_cast<long long>(selected[2].pts_us),
+            static_cast<long long>(selected[3].pts_us),
+            static_cast<unsigned long long>(selected[0].frame_id),
+            static_cast<unsigned long long>(selected[1].frame_id),
+            static_cast<unsigned long long>(selected[2].frame_id),
+            static_cast<unsigned long long>(selected[3].frame_id));
 
    if (!encoder_ || !encoder_->PushBuffer(dst_buffer)) 
     {
@@ -769,6 +1128,12 @@ void MosaicComposer::ComposeLocked()
             fps_,
             mosaic_push_count_ * 1.0 / fps_);
     }
+    for (auto& input : selected) 
+    {
+        ReleaseInput(input);
+    }
+    
+    
     MaybeLogStatsLocked("compose");
 }
 

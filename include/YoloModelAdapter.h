@@ -48,6 +48,7 @@ public:
         data.channel_id = frame.channel_id;
         data.frame_id = frame.frame_id;
         data.pts_us = frame.pts_us;
+        data.origin_wall_ms = frame.origin_wall_ms;
 
         size_t pending_before = PendingCount();
         bool ok = false;
@@ -121,6 +122,7 @@ private:
         output.frame.channel_id = infer_out.channel_id;
         output.frame.frame_id = infer_out.frame_id;
         output.frame.pts_us = infer_out.pts_us;
+        output.frame.origin_wall_ms = infer_out.origin_wall_ms;
         output.frame.src_fd = infer_out.src_fd;
         output.frame.src_buffer = infer_out.src_buffer;
         output.frame.width = infer_out.width;

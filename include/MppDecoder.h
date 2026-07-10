@@ -35,7 +35,7 @@ class MppDecoder {
 public:
     // 定义一个标准 C++ 回调函数
     // 当解出一帧 YUV 图像时，直接把它的物理 fd 以及高宽步长信息抛给外层
-    using FrameCallback = std::function<void(int src_fd, int width, int height, int hor_stride, int ver_stride, MppFrame frame)>;
+    using FrameCallback = std::function<void(int src_fd, int width, int height, int hor_stride, int ver_stride, int64_t pts_us, MppFrame frame)>;
 
     MppDecoder();
     ~MppDecoder();
