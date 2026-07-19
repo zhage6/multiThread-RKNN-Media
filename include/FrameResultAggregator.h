@@ -32,6 +32,7 @@ public:
     void RegisterExpectedModels(const FrameContext& frame, std::vector<ModelId> models);
     void CancelExpectedFrame(const FrameContext& frame);
     bool Submit(ModelOutput output);
+    size_t PendingCount() const;
 
 private:
     struct FrameAggregate 
@@ -57,7 +58,7 @@ private:
     ComposedFrame MakeComposedFrame(const FrameKey& key, const FrameAggregate& agg, bool partial) const;
 
 private:
-    std::mutex mtx_;
+    mutable std::mutex mtx_;
     std::condition_variable cv_;
     std::deque<ModelOutput> queue_;
     std::map<FrameKey, FrameAggregate> pending_;//按 channel_id + frame_id 暂存同一帧的多个模型结果

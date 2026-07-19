@@ -161,6 +161,12 @@ bool FrameResultAggregator::Submit(ModelOutput output)
     return true;
 }
 
+size_t FrameResultAggregator::PendingCount() const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    return queue_.size() + pending_.size() + registered_since_.size();
+}
+
 void FrameResultAggregator::RegisterExpectedModels(const FrameContext& frame, std::vector<ModelId> models)
 {
     std::lock_guard<std::mutex> lock(mtx_);

@@ -23,6 +23,11 @@ void MultiModelPipeline::SetAggregator(FrameResultAggregator* aggregator)
     aggregator_ = aggregator;
 }
 
+void MultiModelPipeline::SetInvalidOutputCallback(InvalidModelOutputCallback cb)
+{
+    invalid_output_callback_ = std::move(cb);
+}
+
 bool MultiModelPipeline::Submit(const FrameContext& frame)
 {
     if (models_.empty()) 
@@ -74,7 +79,7 @@ bool MultiModelPipeline::Submit(const FrameContext& frame)
 
         if (model->Submit(task_frame, [this](ModelOutput output)
         {
-            PushCompleted(std::move(output));
+            ForwardCompleted(std::move(output));
         })) 
         {
             any_submitted = true;
@@ -106,40 +111,37 @@ size_t MultiModelPipeline::PendingCount() const
         }
     }
 
-    {
-        std::lock_guard<std::mutex> lock(completed_mtx_);
-        total += completed_outputs_.size();
-    }
-
     return total;
 }
 
-void MultiModelPipeline::PushCompleted(ModelOutput output)
+size_t MultiModelPipeline::DrainPendingCount() const
 {
-    std::lock_guard<std::mutex> lock(completed_mtx_);
-    completed_outputs_.push_back(std::move(output));
+    size_t total = PendingCount();
+    if (aggregator_) {
+        total += aggregator_->PendingCount();
+    }
+    return total;
 }
 
-bool MultiModelPipeline::TryGet(ModelOutput& output)
+void MultiModelPipeline::ForwardCompleted(ModelOutput output)
 {
+    if (output.frame.frame_id == static_cast<uint64_t>(-1))
     {
-        std::lock_guard<std::mutex> lock(completed_mtx_);
-        if (!completed_outputs_.empty()) 
-        {
-            output = std::move(completed_outputs_.front());
-            completed_outputs_.pop_front();
-            return true;
+        const int channel_id = output.frame.channel_id;
+        if (invalid_output_callback_) {
+            invalid_output_callback_(channel_id);
         }
+
+        if (output.frame.src_buffer) {
+            mpp_buffer_put(output.frame.src_buffer);
+        }
+        return;
     }
 
-    for (auto& entry : models_)
-    {
-        IModelAdapter* model = entry.model;
-        if (model && model->TryGet(output)) 
-        {
-            return true;
+    MppBuffer src_buffer = output.frame.src_buffer;
+    if (!aggregator_ || !aggregator_->Submit(std::move(output))) {
+        if (src_buffer) {
+            mpp_buffer_put(src_buffer);
         }
     }
-
-    return false;
 }

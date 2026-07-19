@@ -45,7 +45,7 @@ namespace
 } // namespace
 
 VideoChannel::VideoChannel(int channel_id, const std::string& stream_url, 
-                    MultiModelPipeline* pipeline,std::atomic<int>& active_cnt, MosaicComposer* mosaic, FrameResultAggregator* aggregator)
+                    MultiModelPipeline* pipeline,std::atomic<int>& active_cnt, MosaicComposer* mosaic)
         : m_channel_id(channel_id), 
           m_stream_url(stream_url), 
           m_pipeline(pipeline),
@@ -53,7 +53,6 @@ VideoChannel::VideoChannel(int channel_id, const std::string& stream_url,
           m_frame_counter(0),
           m_active_count(active_cnt),
           m_mosaic(mosaic),
-          m_aggregator(aggregator),
           m_encoder(nullptr),
           m_encode_packet_counter(0),
           m_last_packet_pts(-1),
@@ -90,7 +89,7 @@ void VideoChannel::start()
 {
     if(m_running) return;
         m_running = true;
-        if (m_aggregator || m_mosaic) 
+        if (m_mosaic)
         {
             m_encoder_ready = true;
         }
@@ -403,27 +402,6 @@ void VideoChannel::OnInferDropped()
     }
 }
 
-
-void VideoChannel::ReleaseModelOutput(const ModelOutput& output)
-{
-    if (output.frame.src_buffer) 
-    {
-        mpp_buffer_put(output.frame.src_buffer);
-    }
-}
-
-void VideoChannel::OnModelOutput(const ModelOutput& output)
-{
-    if (!m_aggregator || !m_aggregator->Submit(output))
-    {
-        timing::Log("model_agg_submit_fail model=%s ch=%d frame=%llu boxes=%d",
-                    output.result.model_id.c_str(),
-                    output.frame.channel_id,
-                    static_cast<unsigned long long>(output.frame.frame_id),
-                    output.result.detections.count);
-        ReleaseModelOutput(output);
-    }
-}
 
 void VideoChannel::OnFrameAggregated(uint64_t frame_id)
 {

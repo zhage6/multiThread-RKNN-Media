@@ -1,5 +1,7 @@
 #include <stdio.h>
+#include <chrono>
 #include <memory>
+#include <thread>
 #include <vector>
 #include <sys/time.h>
 
@@ -60,6 +62,13 @@ int main(int argc, char **argv)
     FrameResultAggregator aggregator;
     MultiModelPipeline pipeline;
     pipeline.SetAggregator(&aggregator);
+    pipeline.SetInvalidOutputCallback([&channels](int channel_id)
+    {
+        if (channel_id >= 0 && channel_id < static_cast<int>(channels.size()) && channels[channel_id])
+        {
+            channels[channel_id]->OnInferDropped();
+        }
+    });
     pipeline.AddModel(&yolo, 1);
     pipeline.AddModel(&face, 3);
     aggregator.SetRequiredModels({"yolo"});
@@ -90,10 +99,10 @@ int main(int argc, char **argv)
     }
 
     mosaic.Init(1920, 1080, 24);
-    channels.push_back(std::make_unique<VideoChannel>(0, "../test.h264", &pipeline,active_channels, &mosaic,&aggregator));
-    channels.push_back(std::make_unique<VideoChannel>(1, "../test2.h264", &pipeline,active_channels, &mosaic,&aggregator));
-    channels.push_back(std::make_unique<VideoChannel>(2, "../test3.h264", &pipeline,active_channels, &mosaic,&aggregator));
-    channels.push_back(std::make_unique<VideoChannel>(3, "../test4.h264", &pipeline,active_channels, &mosaic,&aggregator));
+    channels.push_back(std::make_unique<VideoChannel>(0, "../test.h264", &pipeline,active_channels, &mosaic));
+    channels.push_back(std::make_unique<VideoChannel>(1, "../test2.h264", &pipeline,active_channels, &mosaic));
+    channels.push_back(std::make_unique<VideoChannel>(2, "../test3.h264", &pipeline,active_channels, &mosaic));
+    channels.push_back(std::make_unique<VideoChannel>(3, "../test4.h264", &pipeline,active_channels, &mosaic));
 //    channels.push_back(std::make_unique<VideoChannel>(4, "../test5.h264", &yolo,active_channels, &mosaic));
 //    channels.push_back(std::make_unique<VideoChannel>(5, "../test6.h264", &yolo,active_channels, &mosaic));
     
@@ -105,54 +114,18 @@ int main(int argc, char **argv)
         ch->start();
     }
     printf("4路视频解码流水线全速启动...\n");
-    printf("主线程开始接收推理结果并写入 MP4...\n");
+    printf("模型结果将直接进入聚合器，主线程等待流水线排空...\n");
 
     while (true) 
     {
         // 如果所有通道都已经关闭或异常退出，主线程结束
-       if (active_channels == 0 && pipeline.PendingCount() == 0) 
+        if (active_channels == 0 && pipeline.DrainPendingCount() == 0)
         {
             printf("所有通道已关闭，推理结果已消费完，退出主循环。\n");
             break;
         }
-        
-        ModelOutput output; 
-        // 从全局 NPU 池中阻塞/非阻塞获取推理完成的结果
-        if (pipeline.TryGet(output))
-        {
-            // 过滤掉无效帧（比如解码错误或模型处理失败的帧）
-           if (output.frame.frame_id == static_cast<uint64_t>(-1))
-            {
-                if (output.frame.channel_id >= 0 && output.frame.channel_id < channels.size()) 
-                {
-                    channels[output.frame.channel_id]->OnInferDropped();
-                }
-                if (output.frame.src_buffer) 
-                {
-                    mpp_buffer_put(output.frame.src_buffer);
-                }
-                continue;
-            }
 
-            // ===================================================================
-            // 核心优化 4：O(1) 数组下标直接映射 + 防爆护盾
-            // CPU 只需要一次加法指令即可找到目标对象，L1 Cache 命中率极高
-            // ===================================================================
-            if (output.frame.channel_id >= 0 && output.frame.channel_id < channels.size())
-            {
-                // 通道层不再重排，模型结果直接进入统一聚合器。
-                channels[output.frame.channel_id]->OnModelOutput(output);
-            }
-            else
-            {
-                fprintf(stderr, "致命警告: 收到非法的 Channel ID: %d,越界丢弃!\n",
-                        output.frame.channel_id);
-                if (output.frame.src_buffer) 
-                {
-                    mpp_buffer_put(output.frame.src_buffer);
-                }
-            }
-        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     // 4. 安全退出与资源释放

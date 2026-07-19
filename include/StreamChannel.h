@@ -10,7 +10,6 @@
 #include "rkYolov5s.hpp"
 #include "StreamPublisher.h"
 #include "MosaicComposer.h"
-#include "FrameResultAggregator.h"
 #include "FrameTypes.h"
 #include "IModelAdapter.h"
 #include "MultiModelPipeline.h"
@@ -40,13 +39,11 @@ class VideoChannel
 {
     public:
         VideoChannel(int channel_id, const std::string& stream_url, 
-                    MultiModelPipeline* m_pipeline,std::atomic<int>& active_cnt, MosaicComposer* mosaic = nullptr,FrameResultAggregator* aggregator = nullptr);
+                    MultiModelPipeline* m_pipeline,std::atomic<int>& active_cnt, MosaicComposer* mosaic = nullptr);
         ~VideoChannel();
         void start();
         void Stop();
         void OnInferDropped();
-        void OnModelOutput(const ModelOutput& output);
-        void ReleaseModelOutput(const ModelOutput& output);
         void OnFrameAggregated(uint64_t frame_id);
 
     private: 
@@ -83,7 +80,5 @@ class VideoChannel
 
         std::atomic<bool> m_encoder_ready; //热身变量，系统等待编码器链路打通
         int m_startup_max_inflight_frames;
-
-        FrameResultAggregator* m_aggregator;
 
 };

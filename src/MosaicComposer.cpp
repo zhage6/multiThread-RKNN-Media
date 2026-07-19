@@ -7,6 +7,8 @@
 #define MPP_ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 namespace 
 {
+    constexpr int kMaxRenderBoxesPerModel = 3;
+
     void release_source_buffer(const InferOutput& out)
     {
         if (out.src_buffer) 
@@ -772,9 +774,36 @@ RenderStats RenderModelResult(const ModelResult& result,
         const int cell_right = dst_rect.x + dst_rect.width;
         const int cell_bottom = dst_rect.y + dst_rect.height;
 
-        for (int j = 0; j < result.detections.count; ++j) 
+        std::array<int, kMaxRenderBoxesPerModel> top_indices {};
+        top_indices.fill(-1);
+        const int detection_count = std::min(result.detections.count, OBJ_NUMB_MAX_SIZE);
+
+        for (int j = 0; j < detection_count; ++j)
         {
-            const auto& res = result.detections.results[j];
+            for (int rank = 0; rank < kMaxRenderBoxesPerModel; ++rank)
+            {
+                const int current = top_indices[rank];
+                if (current >= 0 &&
+                    result.detections.results[j].prop <= result.detections.results[current].prop)
+                {
+                    continue;
+                }
+
+                for (int shift = kMaxRenderBoxesPerModel - 1; shift > rank; --shift) {
+                    top_indices[shift] = top_indices[shift - 1];
+                }
+                top_indices[rank] = j;
+                break;
+            }
+        }
+
+        for (int index : top_indices)
+        {
+            if (index < 0) {
+                continue;
+            }
+
+            const auto& res = result.detections.results[index];
 
             int src_left = clamp_to_range(res.box.left, 0, input.width - 2);
             int src_top = clamp_to_range(res.box.top, 0, input.height - 2);
@@ -797,6 +826,7 @@ RenderStats RenderModelResult(const ModelResult& result,
             rect.width = right - left;
             rect.height = bottom - top;
             box_batch.push_back(rect);
+            stats.boxes++;
 
             if (res.has_landmarks) {
                 for (int k = 0; k < FACE_LANDMARK_NUM; ++k) {
@@ -815,13 +845,12 @@ RenderStats RenderModelResult(const ModelResult& result,
                 }
             }
         }
-        stats.boxes += result.detections.count;
-        if (result.model_id == "face_yolo" && result.detections.count > 0) 
+        if (result.model_id == "face_yolo" && stats.boxes > 0)
         {
             timing::Log("mosaic_render_face ch=%d frame=%llu boxes=%d",
                         channel_index,
                         static_cast<unsigned long long>(input.frame_id),
-                        result.detections.count);
+                        stats.boxes);
         }
         break;
     }
