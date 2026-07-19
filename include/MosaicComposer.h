@@ -73,6 +73,7 @@ private:
     bool AllocateOutputBuffers(int count);
     void ReleaseOutputBuffers();
     bool SelectSyncedInputsLocked(int64_t target_pts_us,std::array<MosaicInput, kChannels>& selected);
+    void PruneExpiredInputsLocked(int64_t target_pts_us);
     std::mutex mtx_;
     std::array<MosaicInput, kChannels> latest_;
 

@@ -92,10 +92,8 @@ void FrameResultAggregator::Stop()
         ReleaseAggregate(item.second);
     }
     pending_.clear();
-    expected_publish_frame_.clear();
-    max_seen_frame_.clear();
-    missing_since_.clear();
     expected_models_.clear();
+    registered_since_.clear();
 }
 void FrameResultAggregator::ReleaseFrame(FrameContext& frame)
 {
@@ -180,51 +178,26 @@ void FrameResultAggregator::RegisterExpectedModels(const FrameContext& frame, st
     }
 
     expected_models_[key] = std::move(models);
+    if (registered_since_.find(key) == registered_since_.end()) {
+        registered_since_.emplace(key, std::chrono::steady_clock::now());
+    }
+    cv_.notify_one();
 }
 
-void FrameResultAggregator::SkipFrame(int channel_id, uint64_t frame_id)
+void FrameResultAggregator::CancelExpectedFrame(const FrameContext& frame)
 {
     std::lock_guard<std::mutex> lock(mtx_);
 
     FrameKey key;
-    key.channel_id = channel_id;
-    key.frame_id = frame_id;
+    key.channel_id = frame.channel_id;
+    key.frame_id = frame.frame_id;
 
-    if (IsFinishedLocked(key)) {
-        timing::Log("agg_skip_already_finished ch=%d frame=%llu",
-                    channel_id,
-                    static_cast<unsigned long long>(frame_id));
+    if (pending_.find(key) != pending_.end()) {
         return;
     }
 
-    auto pending = pending_.find(key);
-    if (pending != pending_.end()) {
-        timing::Log("agg_skip_release_pending ch=%d frame=%llu results=%zu models=%s",
-                    channel_id,
-                    static_cast<unsigned long long>(frame_id),
-                    pending->second.results.size(),
-                    ResultModelsString(pending->second.results).c_str());
-        ReleaseAggregate(pending->second);
-        pending_.erase(pending);
-    }
-
-    missing_since_.erase(key);
     expected_models_.erase(key);
-    RememberFinishedLocked(key);
-
-    auto expected = expected_publish_frame_.find(channel_id);
-    if (expected == expected_publish_frame_.end()) {
-        expected_publish_frame_[channel_id] = frame_id + 1;
-    } else if (frame_id >= expected->second) {
-        expected->second = frame_id + 1;
-    }
-
-    timing::Log("agg_skip_frame ch=%d frame=%llu next_expected=%llu",
-                channel_id,
-                static_cast<unsigned long long>(frame_id),
-                static_cast<unsigned long long>(expected_publish_frame_[channel_id]));
-
-    PublishAvailableLocked();
+    registered_since_.erase(key);
 }
 
 void FrameResultAggregator::WorkerLoop()
@@ -250,9 +223,9 @@ void FrameResultAggregator::WorkerLoop()
                 output = std::move(queue_.front());
                 queue_.pop_front();
             } 
-            else 
+            else //如果队列是空的
             {
-                PublishTimeoutLocked();
+                PublishTimeoutLocked(); //先检查有没有超时
                 continue;
             }
         }
@@ -283,41 +256,13 @@ void FrameResultAggregator::AddResult(ModelOutput output)
         return;
     }
 
-    auto seen = max_seen_frame_.find(key.channel_id);
-    if (seen == max_seen_frame_.end() || key.frame_id > seen->second) //刷新见过的最大帧
-    {
-        max_seen_frame_[key.channel_id] = key.frame_id;
-        timing::Log("agg_max_seen_update ch=%d frame=%llu model=%s",
-                    key.channel_id,
-                    static_cast<unsigned long long>(key.frame_id),
-                    output.result.model_id.c_str());
-    }
-
-    auto expected = expected_publish_frame_.find(key.channel_id);// 初始化要发布的第一帧
-    if (expected == expected_publish_frame_.end()) 
-    {
-        expected_publish_frame_[key.channel_id] = key.frame_id;
-    } 
-    else if (key.frame_id < expected->second) //帧来晚了，expect已经是当前要发布的帧，这个窗口已经过了相当于
-    {
-        timing::Log("agg_late_drop model=%s ch=%d frame=%llu reason=behind_expected expected=%llu boxes=%d",
-                    output.result.model_id.c_str(),
-                    key.channel_id,
-                    static_cast<unsigned long long>(key.frame_id),
-                    static_cast<unsigned long long>(expected->second),
-                    output.result.detections.count);
-        ReleaseOutput(output);
-        RememberFinishedLocked(key);
-        return;
-    }
-
     auto& agg = pending_[key]; //查找聚合帧map中有没有对应的那一帧
-    missing_since_.erase(key);
     bool first_result = agg.results.empty();//如果是模型的某一帧中的第一帧结果则记上时间，方便后续做超时计算
     if (first_result) 
     {
         agg.frame = output.frame;
         agg.first_seen = std::chrono::steady_clock::now();
+        registered_since_.erase(key);
         timing::Log("agg_first_result model=%s ch=%d frame=%llu",
                     output.result.model_id.c_str(),
                     key.channel_id,
@@ -364,107 +309,78 @@ void FrameResultAggregator::PublishAvailableLocked()
 {
     auto now = std::chrono::steady_clock::now();
 
-    for (auto& expected : expected_publish_frame_) 
+    for (auto it = pending_.begin(); it != pending_.end();)
     {
-        const int channel_id = expected.first;
+        const FrameKey key = it->first;
+        const bool ready = HasRequiredResultsLocked(key, it->second);
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - it->second.first_seen);
+        const bool timed_out = waited >= timeout_;
 
-        while (true) 
+        if (!ready && !timed_out)
         {
-            FrameKey key;
-            key.channel_id = channel_id;
-            key.frame_id = expected.second;
+            ++it;
+            continue;
+        }
 
-            auto it = pending_.find(key);
-            if (it == pending_.end())  //如果没找到(也就是说没有这一帧)
-            {
-                auto seen = max_seen_frame_.find(channel_id);
-                if (seen == max_seen_frame_.end() || seen->second <= key.frame_id) 
-                {
-                    missing_since_.erase(key);//这个就是为了后面弥补等到的results
-                    break;
-                }
-
-                auto missing = missing_since_.find(key);
-                if (missing == missing_since_.end()) {
-                    missing_since_[key] = now;
-                    timing::Log("agg_missing_start ch=%d frame=%llu max_seen=%llu",
-                                channel_id,
-                                static_cast<unsigned long long>(key.frame_id),
-                                static_cast<unsigned long long>(seen->second));
-                    break;
-                }
-
-                const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now - missing->second);
-                if (waited < timeout_) 
-                {
-                    break;
-                }
-
-                auto drop_cb = on_frame_dropped_;
-                timing::Log("agg_missing_drop ch=%d frame=%llu max_seen=%llu waited_ms=%lld",
-                            channel_id,
-                            static_cast<unsigned long long>(key.frame_id),
-                            static_cast<unsigned long long>(seen->second),
-                            static_cast<long long>(waited.count()));
-                RememberFinishedLocked(key);
-                missing_since_.erase(missing);
-                expected_models_.erase(key);
-                expected.second++;
-
-                if (drop_cb) {
-                    drop_cb(channel_id, key.frame_id);
-                }
-
-                continue;
+        ComposedFrame frame = MakeComposedFrame(key, it->second, !ready);
+        const std::string models = ResultModelsString(it->second.results);
+        bool has_face = false;
+        int face_boxes = 0;
+        int yolo_boxes = 0;
+        for (const auto& result : frame.results) {
+            if (result.model_id == "face_yolo") {
+                has_face = true;
+                face_boxes = result.detections.count;
+            } else if (result.model_id == "yolo") {
+                yolo_boxes = result.detections.count;
             }
+        }
+        timing::Log("agg_publish ch=%d frame=%llu partial=%d ready=%d results=%zu models=%s has_face=%d face_boxes=%d yolo_boxes=%d waited_ms=%lld",
+                    key.channel_id,
+                    static_cast<unsigned long long>(key.frame_id),
+                    frame.partial ? 1 : 0,
+                    ready ? 1 : 0,
+                    frame.results.size(),
+                    models.c_str(),
+                    has_face ? 1 : 0,
+                    face_boxes,
+                    yolo_boxes,
+                    static_cast<long long>(waited.count()));
+        auto cb = on_frame_ready_;
+        RememberFinishedLocked(key);
+        expected_models_.erase(key);
+        it = pending_.erase(it);
 
-            const bool ready = HasRequiredResultsLocked(key, it->second);
-            const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - it->second.first_seen);
-            const bool timed_out = waited >= timeout_;
+        if (cb) {
+            cb(frame);
+        } else {
+            ReleaseFrame(frame.frame);
+        }
+    }
 
-            if (!ready && !timed_out) 
-            {
-                break; //要两个都满足也就是模型没到齐，同时没超时才会接着等，不然就直接submit了
-            }
+    for (auto it = registered_since_.begin(); it != registered_since_.end();)
+    {
+        const FrameKey key = it->first;
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - it->second);
+        if (waited < timeout_)
+        {
+            ++it;
+            continue;
+        }
 
-            ComposedFrame frame = MakeComposedFrame(key, it->second, !ready);
-            const std::string models = ResultModelsString(it->second.results);
-            bool has_face = false;
-            int face_boxes = 0;
-            int yolo_boxes = 0;
-            for (const auto& result : frame.results) {
-                if (result.model_id == "face_yolo") {
-                    has_face = true;
-                    face_boxes = result.detections.count;
-                } else if (result.model_id == "yolo") {
-                    yolo_boxes = result.detections.count;
-                }
-            }
-            timing::Log("agg_publish ch=%d frame=%llu partial=%d ready=%d results=%zu models=%s has_face=%d face_boxes=%d yolo_boxes=%d waited_ms=%lld",
-                        channel_id,
-                        static_cast<unsigned long long>(key.frame_id),
-                        frame.partial ? 1 : 0,
-                        ready ? 1 : 0,
-                        frame.results.size(),
-                        models.c_str(),
-                        has_face ? 1 : 0,
-                        face_boxes,
-                        yolo_boxes,
-                        static_cast<long long>(waited.count()));
-            auto cb = on_frame_ready_;
-            RememberFinishedLocked(key);
-            missing_since_.erase(key);
-            expected_models_.erase(key);
-            pending_.erase(it);
-            expected.second++;
+        auto drop_cb = on_frame_dropped_;
+        timing::Log("agg_no_result_drop ch=%d frame=%llu waited_ms=%lld",
+                    key.channel_id,
+                    static_cast<unsigned long long>(key.frame_id),
+                    static_cast<long long>(waited.count()));
+        RememberFinishedLocked(key);
+        expected_models_.erase(key);
+        it = registered_since_.erase(it);
 
-            if (cb) {
-                cb(frame);
-            } else {
-                ReleaseFrame(frame.frame);
-            }
+        if (drop_cb) {
+            drop_cb(key.channel_id, key.frame_id);
         }
     }
 }

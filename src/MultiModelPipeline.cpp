@@ -87,6 +87,10 @@ bool MultiModelPipeline::Submit(const FrameContext& frame)
         }
     }
 
+    if (!any_submitted && aggregator_) {
+        aggregator_->CancelExpectedFrame(frame);
+    }
+
     return any_submitted;
 }
 

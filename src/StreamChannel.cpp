@@ -54,16 +54,12 @@ VideoChannel::VideoChannel(int channel_id, const std::string& stream_url,
           m_active_count(active_cnt),
           m_mosaic(mosaic),
           m_aggregator(aggregator),
-          m_expected_frame_id(0), // 初始化期待的帧号
           m_encoder(nullptr),
           m_encode_packet_counter(0),
           m_last_packet_pts(-1),
           m_output_fps(24),
           m_throttle_local_input(is_local_stream_url(stream_url)),
           m_input_fps(24),
-          m_reorder_waiting(false),
-          m_reorder_timeout(std::chrono::milliseconds(120)),
-          m_reorder_drop_count(0),
           m_inflight_frames(0),
           m_max_inflight_frames(8),   //每路最大帧
           m_encoder_ready(false),
@@ -213,298 +209,15 @@ void VideoChannel::start()
         }, 
         MPP_VIDEO_CodingAVC    
         );
-        m_output_thread = std::thread(&VideoChannel::OutputLoop, this); //开启两个关键线程，一个是输出线程一个是解码线程
         m_decode_thread = std::thread(&VideoChannel::DecodeLoop, this);
 }
 void VideoChannel::Stop() 
 {
     m_running = false;
     m_encoder_ready = false;
-    m_output_queue.stop();
-    m_model_output_queue.stop();  // 新 ModelOutput 路径必须加
 
     if (m_decode_thread.joinable()) {
         m_decode_thread.join();
-    }
-
-    if (m_output_thread.joinable()) {
-        m_output_thread.join();
-    }
-}
-
-
-void VideoChannel::OnInferOutput(const InferOutput& out) 
-{
-    m_inflight_frames--;
-    if (!m_output_queue.push(out)) {
-        printf("警告：通道 %d 输出队列满，丢弃 frame %llu\n",
-               m_channel_id,
-               static_cast<unsigned long long>(out.frame_id));
-
-        if (out.src_buffer) 
-        {
-            mpp_buffer_put(out.src_buffer);//到这里才解码后第一帧的内存
-        }
-    }
-}
-
-void VideoChannel::OutputLoop()
-{
-    ModelOutput output;
-    while (m_model_output_queue.pop(output)) 
-    {
-        ProcessModelOutput(output);
-    }
-}
-
-void VideoChannel::ProcessModelOutput(const ModelOutput& output)
-{
-    std::lock_guard<std::mutex> lock(m_reorder_mtx);
-
-    uint64_t frame_id = output.frame.frame_id;
-    timing::Log("model_queue_pop model=%s ch=%d frame=%llu boxes=%d",
-                output.result.model_id.c_str(),
-                output.frame.channel_id,
-                static_cast<unsigned long long>(frame_id),
-                output.result.detections.count);
-
-    if (frame_id < m_expected_frame_id) 
-    {
-        if (m_reorder_skipped_frames.count(frame_id)) {
-            timing::Log("model_reorder_skipped_drop model=%s ch=%d frame=%llu expected=%llu boxes=%d",
-                        output.result.model_id.c_str(),
-                        output.frame.channel_id,
-                        static_cast<unsigned long long>(frame_id),
-                        static_cast<unsigned long long>(m_expected_frame_id),
-                        output.result.detections.count);
-            ReleaseModelOutput(output);
-            return;
-        }
-
-        timing::Log("model_reorder_late_submit model=%s ch=%d frame=%llu expected=%llu boxes=%d",
-                    output.result.model_id.c_str(),
-                    output.frame.channel_id,
-                    static_cast<unsigned long long>(frame_id),
-                    static_cast<unsigned long long>(m_expected_frame_id),
-                    output.result.detections.count);
-        SubmitModelOutputToAggregator(output);
-        return;
-    }
-
-    m_model_reorder_buffer[frame_id].push_back(output);
-
-    while (true) {
-        auto it = m_model_reorder_buffer.find(m_expected_frame_id);
-
-        if (it != m_model_reorder_buffer.end()) {
-            timing::Log("model_reorder_forward ch=%d frame=%llu outputs=%zu expected=%llu buffered=%zu",
-                        m_channel_id,
-                        static_cast<unsigned long long>(m_expected_frame_id),
-                        it->second.size(),
-                        static_cast<unsigned long long>(m_expected_frame_id),
-                        m_model_reorder_buffer.size());
-            for (const auto& item : it->second) {
-                SubmitModelOutputToAggregator(item);
-            }
-
-            m_model_reorder_buffer.erase(it);
-            m_reorder_waiting = false;
-            m_expected_frame_id++;
-            continue;
-        }
-
-        if (m_model_reorder_buffer.empty()) {
-            m_reorder_waiting = false;
-            break;
-        }
-
-        auto now = std::chrono::steady_clock::now();
-
-        if (!m_reorder_waiting) {
-            m_reorder_waiting = true;
-            m_reorder_wait_start = now;
-            break;
-        }
-
-        if (now - m_reorder_wait_start >= m_reorder_timeout) 
-        {
-            const uint64_t skipped_frame_id = m_expected_frame_id;
-            timing::Log("model_reorder_timeout ch=%d frame=%llu buffered=%zu",
-                m_channel_id,
-                static_cast<unsigned long long>(skipped_frame_id),
-                m_model_reorder_buffer.size());
-            if (!m_model_reorder_buffer.empty()) {
-                timing::Log("model_reorder_timeout_detail ch=%d skipped=%llu next_buffered=%llu last_buffered=%llu",
-                            m_channel_id,
-                            static_cast<unsigned long long>(skipped_frame_id),
-                            static_cast<unsigned long long>(m_model_reorder_buffer.begin()->first),
-                            static_cast<unsigned long long>(m_model_reorder_buffer.rbegin()->first));
-            }
-            m_reorder_skipped_frames.insert(skipped_frame_id);
-            if (m_aggregator) {
-                m_aggregator->SkipFrame(m_channel_id, skipped_frame_id);
-            }
-            OnFrameAggregated(skipped_frame_id);
-            m_expected_frame_id++;
-            m_reorder_waiting = false;
-            continue;
-        }
-
-        break;
-    }
-}
-
-void VideoChannel::SubmitModelOutputToAggregator(const ModelOutput& output)
-{
-    if (!m_aggregator || !m_aggregator->Submit(output)) 
-    {
-        timing::Log("model_agg_submit_fail model=%s ch=%d frame=%llu boxes=%d",
-                    output.result.model_id.c_str(),
-                    output.frame.channel_id,
-                    static_cast<unsigned long long>(output.frame.frame_id),
-                    output.result.detections.count);
-        ReleaseModelOutput(output);
-    }
-}
-
-
-void VideoChannel::ProcessInferOutput(const InferOutput& out) 
-{
-   std::lock_guard<std::mutex> lock(m_reorder_mtx);
-
-    // 已经被跳过的迟到帧，直接丢掉，不能再进入 reorder。
-    if (out.frame_id < m_expected_frame_id) {
-        timing::Log("reorder_late_drop ch=%d frame=%llu expected=%llu",
-                    m_channel_id,
-                    static_cast<unsigned long long>(out.frame_id),
-                    static_cast<unsigned long long>(m_expected_frame_id));
-        release_source_buffer(out);
-        return;
-    }
-
-    auto old = m_reorder_buffer.find(out.frame_id);
-    if (old != m_reorder_buffer.end()) 
-    {
-        release_source_buffer(old->second);
-        old->second = out;
-    } 
-    else 
-    {
-        m_reorder_buffer[out.frame_id] = out;
-    }
-
-    while (true)
-    {
-        auto it = m_reorder_buffer.find(m_expected_frame_id);
-
-        if (it != m_reorder_buffer.end())
-        {
-            auto current_out = it->second;
-            m_reorder_buffer.erase(it);
-
-            m_reorder_waiting = false;
-
-            timing::Log("reorder_pop ch=%d frame=%llu reorder_left=%zu expected=%llu",
-                        m_channel_id,
-                        static_cast<unsigned long long>(current_out.frame_id),
-                        m_reorder_buffer.size(),
-                        static_cast<unsigned long long>(m_expected_frame_id));
-            
-            if (m_aggregator || m_mosaic) 
-            {
-                m_encoder_ready = true;
-            }
-            if(m_aggregator)
-            {
-                ComposedFrame composed = MakeYoloComposedFrame(current_out);
-
-                ModelOutput output;
-                output.frame = composed.frame;
-
-                if (!composed.results.empty()) 
-                {
-                    output.result = composed.results.front();
-                } 
-                else 
-                {
-                    output.result.model_id = "yolo";
-                    output.result.type = ModelResultType::Detection;
-                    output.result.ok = false;
-                    output.result.error = "empty yolo result";
-                }
-                if (!m_aggregator->Submit(std::move(output))) 
-                {
-                    release_source_buffer(current_out);
-                }
-            }            
-            //EncodeZeroCopy(current_out);
-            else if (m_mosaic) 
-            {
-                m_encoder_ready = true;
-                m_mosaic->Submit(current_out);
-            } 
-            else 
-            {
-                EncodeZeroCopy(current_out);
-            }
-            m_expected_frame_id++;
-            continue;
-        }
-
-        if (m_reorder_buffer.empty()) {
-            m_reorder_waiting = false;
-            break;
-        }
-
-        auto now = std::chrono::steady_clock::now();
-
-        if (!m_reorder_waiting) {
-            m_reorder_waiting = true;
-            m_reorder_wait_start = now;
-            break;
-        }
-
-        auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - m_reorder_wait_start);
-
-        if (waited >= m_reorder_timeout) {
-            timing::Log("reorder_timeout_drop ch=%d missing=%llu waited_ms=%lld next_ready=%llu reorder_size=%zu drop_count=%llu",
-                        m_channel_id,
-                        static_cast<unsigned long long>(m_expected_frame_id),
-                        static_cast<long long>(waited.count()),
-                        static_cast<unsigned long long>(m_reorder_buffer.begin()->first),
-                        m_reorder_buffer.size(),
-                        static_cast<unsigned long long>(m_reorder_drop_count + 1));
-
-            printf("警告：通道 %d 等待 frame %llu 超时，跳过。\n",
-                   m_channel_id,
-                   static_cast<unsigned long long>(m_expected_frame_id));
-
-            m_expected_frame_id++;
-            m_reorder_drop_count++;
-            m_reorder_waiting = false;
-            continue;
-        }
-
-        break;
-    }
-
-    if (m_reorder_buffer.size() > 20) 
-    {
-        uint64_t new_expected = m_reorder_buffer.begin()->first;
-
-        timing::Log("reorder_overflow ch=%d size=%zu old_expected=%llu new_expected=%llu",
-                    m_channel_id,
-                    m_reorder_buffer.size(),
-                    static_cast<unsigned long long>(m_expected_frame_id),
-                    static_cast<unsigned long long>(new_expected));
-
-        printf("警告：通道 %d reorder 堆积过多，强制跳到 frame %llu。\n",
-               m_channel_id,
-               static_cast<unsigned long long>(new_expected));
-
-        m_expected_frame_id = new_expected;
-        m_reorder_waiting = false;
     }
 }
 
@@ -529,6 +242,7 @@ void VideoChannel::DecodeLoop()
             {
                 break;
             }
+            
 
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
@@ -700,9 +414,9 @@ void VideoChannel::ReleaseModelOutput(const ModelOutput& output)
 
 void VideoChannel::OnModelOutput(const ModelOutput& output)
 {
-    if (!m_model_output_queue.push(output)) 
+    if (!m_aggregator || !m_aggregator->Submit(output))
     {
-        timing::Log("model_queue_drop model=%s ch=%d frame=%llu boxes=%d reason=full",
+        timing::Log("model_agg_submit_fail model=%s ch=%d frame=%llu boxes=%d",
                     output.result.model_id.c_str(),
                     output.frame.channel_id,
                     static_cast<unsigned long long>(output.frame.frame_id),

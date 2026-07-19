@@ -562,6 +562,24 @@ bool MosaicComposer::SelectSyncedInputsLocked(int64_t target_pts_us,std::array<M
     return true;
 }
 
+void MosaicComposer::PruneExpiredInputsLocked(int64_t target_pts_us)
+{
+    if (target_pts_us < 0) {
+        return;
+    }
+
+    const int64_t expire_before = target_pts_us - sync_tolerance_us_;
+    for (auto& buffer : pts_buffers_)
+    {
+        auto it = buffer.begin();
+        while (it != buffer.end() && it->first < expire_before)
+        {
+            ReleaseInput(it->second);
+            it = buffer.erase(it);
+        }
+    }
+}
+
 
 void MosaicComposer::Submit(const InferOutput& out)
 {
@@ -883,6 +901,8 @@ void MosaicComposer::ComposeLocked()
     }
 
     // 2. 一张 mosaic 只选一次
+    PruneExpiredInputsLocked(next_mosaic_pts_us_);
+
     std::array<MosaicInput, kChannels> selected;
     for (auto& item : selected) 
     {
