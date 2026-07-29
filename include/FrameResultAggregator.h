@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -41,6 +42,29 @@ private:
         std::vector<ModelResult> results;
         std::chrono::steady_clock::time_point first_seen;
     };
+
+    struct LockStatsSnapshot
+    {
+        uint64_t submit_count = 0;
+        uint64_t submit_total_us = 0;
+        uint64_t submit_max_us = 0;
+        uint64_t submit_over_500us = 0;
+        uint64_t worker_count = 0;
+        uint64_t worker_total_us = 0;
+        uint64_t worker_max_us = 0;
+        uint64_t worker_over_2ms = 0;
+        size_t queue_size = 0;
+        size_t pending_size = 0;
+        size_t registered_size = 0;
+    };
+
+    struct PublishBatch
+    {
+        AggregatedFrameCallback on_frame_ready;
+        DroppedFrameCallback on_frame_dropped;
+        std::vector<ComposedFrame> ready_frames;
+        std::vector<FrameKey> dropped_frames;
+    };
     void ReleaseFrame(FrameContext& frame);
     void ReleaseOutput(ModelOutput& output);
     void ReleaseAggregate(FrameAggregate& agg); //释放资源
@@ -50,12 +74,15 @@ private:
 
     void WorkerLoop();
     void AddResult(ModelOutput output);
-    void PublishReadyLocked();
-    void PublishTimeoutLocked();
-    void PublishAvailableLocked();
+    void PublishAvailableLocked(PublishBatch& batch);
+    void DispatchPublishBatch(PublishBatch& batch);
     const std::vector<ModelId>& ExpectedModelsLocked(const FrameKey& key) const;
     bool HasRequiredResultsLocked(const FrameKey& key, const FrameAggregate& agg) const;
     ComposedFrame MakeComposedFrame(const FrameKey& key, const FrameAggregate& agg, bool partial) const;
+    void RecordSubmitLockWait(long long wait_us);
+    void RecordWorkerLockHold(long long hold_us);
+    bool TakeLockStatsLocked(LockStatsSnapshot& stats);
+    void LogLockStats(const LockStatsSnapshot& stats) const;
 
 private:
     mutable std::mutex mtx_;
@@ -77,4 +104,15 @@ private:
     std::set<FrameKey> finished_frames_;
     std::deque<FrameKey> finished_order_;
     size_t max_finished_history_ = 1024;
+
+    // These counters expose whether direct worker -> aggregator handoff is lock-bound.
+    std::atomic<uint64_t> submit_lock_wait_count_{0};
+    std::atomic<uint64_t> submit_lock_wait_total_us_{0};
+    std::atomic<uint64_t> submit_lock_wait_max_us_{0};
+    std::atomic<uint64_t> submit_lock_wait_over_500us_{0};
+    std::atomic<uint64_t> worker_lock_hold_count_{0};
+    std::atomic<uint64_t> worker_lock_hold_total_us_{0};
+    std::atomic<uint64_t> worker_lock_hold_max_us_{0};
+    std::atomic<uint64_t> worker_lock_hold_over_2ms_{0};
+    std::chrono::steady_clock::time_point last_lock_stats_log_{};
 };

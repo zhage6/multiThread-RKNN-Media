@@ -285,7 +285,8 @@ void VideoChannel::InitEncoder(int width, int height, int h_stride, int v_stride
     {
         printf("通道 %d RTSP 推流初始化失败: %s\n", m_channel_id, rtsp_url.c_str());
     }
-    m_encoder->SetOutputCallback([this](const uint8_t* data, size_t size, bool is_keyframe) 
+    m_encoder->SetOutputCallback([this](const uint8_t* data, size_t size, bool is_keyframe,
+                                        int64_t)
     {
         printf("编码器编码完成一帧\n");
         auto callback_start = timing::Clock::now();

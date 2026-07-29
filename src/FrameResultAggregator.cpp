@@ -134,7 +134,9 @@ void FrameResultAggregator::RememberFinishedLocked(const FrameKey& key)
 
 bool FrameResultAggregator::Submit(ModelOutput output)
 {
-    std::lock_guard<std::mutex> lock(mtx_);
+    const auto lock_wait_start = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(mtx_);
+    RecordSubmitLockWait(timing::UsSince(lock_wait_start));
 
     if (!running_) 
     {
@@ -211,6 +213,10 @@ void FrameResultAggregator::WorkerLoop()
     while (true) 
     {
         ModelOutput output;
+        bool has_output = false;
+        LockStatsSnapshot lock_stats;
+        bool should_log_lock_stats = false;
+        PublishBatch publish_batch;
 
         {
             std::unique_lock<std::mutex> lock(mtx_);
@@ -228,21 +234,99 @@ void FrameResultAggregator::WorkerLoop()
             {
                 output = std::move(queue_.front());
                 queue_.pop_front();
-            } 
-            else //如果队列是空的
-            {
-                PublishTimeoutLocked(); //先检查有没有超时
-                continue;
+                has_output = true;
             }
+
+            const auto lock_hold_start = std::chrono::steady_clock::now();
+            publish_batch.on_frame_ready = on_frame_ready_;
+            publish_batch.on_frame_dropped = on_frame_dropped_;
+
+            if (has_output) {
+                AddResult(std::move(output));
+            }
+            PublishAvailableLocked(publish_batch);
+
+            RecordWorkerLockHold(timing::UsSince(lock_hold_start));
+            should_log_lock_stats = TakeLockStatsLocked(lock_stats);
         }
 
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            AddResult(std::move(output));
-            PublishReadyLocked();
-            PublishTimeoutLocked();
+        if (should_log_lock_stats) {
+            LogLockStats(lock_stats);
         }
+        DispatchPublishBatch(publish_batch);
     }
+}
+
+void FrameResultAggregator::RecordSubmitLockWait(long long wait_us)
+{
+    const uint64_t value = static_cast<uint64_t>(std::max(0LL, wait_us));
+    submit_lock_wait_count_.fetch_add(1, std::memory_order_relaxed);
+    submit_lock_wait_total_us_.fetch_add(value, std::memory_order_relaxed);
+    if (value >= 500) {
+        submit_lock_wait_over_500us_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    uint64_t previous = submit_lock_wait_max_us_.load(std::memory_order_relaxed);
+    while (previous < value &&
+           !submit_lock_wait_max_us_.compare_exchange_weak(
+               previous, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+void FrameResultAggregator::RecordWorkerLockHold(long long hold_us)
+{
+    const uint64_t value = static_cast<uint64_t>(std::max(0LL, hold_us));
+    worker_lock_hold_count_.fetch_add(1, std::memory_order_relaxed);
+    worker_lock_hold_total_us_.fetch_add(value, std::memory_order_relaxed);
+    if (value >= 2000) {
+        worker_lock_hold_over_2ms_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    uint64_t previous = worker_lock_hold_max_us_.load(std::memory_order_relaxed);
+    while (previous < value &&
+           !worker_lock_hold_max_us_.compare_exchange_weak(
+               previous, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+bool FrameResultAggregator::TakeLockStatsLocked(LockStatsSnapshot& stats)
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (last_lock_stats_log_.time_since_epoch().count() != 0 &&
+        now - last_lock_stats_log_ < std::chrono::seconds(1)) {
+        return false;
+    }
+    last_lock_stats_log_ = now;
+
+    stats.submit_count = submit_lock_wait_count_.exchange(0, std::memory_order_relaxed);
+    stats.submit_total_us = submit_lock_wait_total_us_.exchange(0, std::memory_order_relaxed);
+    stats.submit_max_us = submit_lock_wait_max_us_.exchange(0, std::memory_order_relaxed);
+    stats.submit_over_500us = submit_lock_wait_over_500us_.exchange(0, std::memory_order_relaxed);
+    stats.worker_count = worker_lock_hold_count_.exchange(0, std::memory_order_relaxed);
+    stats.worker_total_us = worker_lock_hold_total_us_.exchange(0, std::memory_order_relaxed);
+    stats.worker_max_us = worker_lock_hold_max_us_.exchange(0, std::memory_order_relaxed);
+    stats.worker_over_2ms = worker_lock_hold_over_2ms_.exchange(0, std::memory_order_relaxed);
+    stats.queue_size = queue_.size();
+    stats.pending_size = pending_.size();
+    stats.registered_size = registered_since_.size();
+    return true;
+}
+
+void FrameResultAggregator::LogLockStats(const LockStatsSnapshot& stats) const
+{
+    timing::Log(
+        "agg_lock_health submit_count=%llu submit_wait_avg_us=%llu submit_wait_max_us=%llu submit_wait_over_500us=%llu worker_count=%llu worker_hold_avg_us=%llu worker_hold_max_us=%llu worker_hold_over_2ms=%llu queue=%zu pending=%zu registered=%zu",
+        static_cast<unsigned long long>(stats.submit_count),
+        static_cast<unsigned long long>(stats.submit_count == 0 ? 0 : stats.submit_total_us / stats.submit_count),
+        static_cast<unsigned long long>(stats.submit_max_us),
+        static_cast<unsigned long long>(stats.submit_over_500us),
+        static_cast<unsigned long long>(stats.worker_count),
+        static_cast<unsigned long long>(stats.worker_count == 0 ? 0 : stats.worker_total_us / stats.worker_count),
+        static_cast<unsigned long long>(stats.worker_max_us),
+        static_cast<unsigned long long>(stats.worker_over_2ms),
+        stats.queue_size,
+        stats.pending_size,
+        stats.registered_size);
 }
 
 void FrameResultAggregator::AddResult(ModelOutput output)
@@ -301,17 +385,7 @@ void FrameResultAggregator::AddResult(ModelOutput output)
     }
 }
 
-void FrameResultAggregator::PublishReadyLocked()
-{
-    PublishAvailableLocked();
-}
-
-void FrameResultAggregator::PublishTimeoutLocked()
-{
-    PublishAvailableLocked();
-}
-
-void FrameResultAggregator::PublishAvailableLocked()
+void FrameResultAggregator::PublishAvailableLocked(PublishBatch& batch)
 {
     auto now = std::chrono::steady_clock::now();
 
@@ -353,16 +427,10 @@ void FrameResultAggregator::PublishAvailableLocked()
                     face_boxes,
                     yolo_boxes,
                     static_cast<long long>(waited.count()));
-        auto cb = on_frame_ready_;
         RememberFinishedLocked(key);
         expected_models_.erase(key);
         it = pending_.erase(it);
-
-        if (cb) {
-            cb(frame);
-        } else {
-            ReleaseFrame(frame.frame);
-        }
+        batch.ready_frames.push_back(std::move(frame));
     }
 
     for (auto it = registered_since_.begin(); it != registered_since_.end();)
@@ -376,7 +444,6 @@ void FrameResultAggregator::PublishAvailableLocked()
             continue;
         }
 
-        auto drop_cb = on_frame_dropped_;
         timing::Log("agg_no_result_drop ch=%d frame=%llu waited_ms=%lld",
                     key.channel_id,
                     static_cast<unsigned long long>(key.frame_id),
@@ -384,10 +451,28 @@ void FrameResultAggregator::PublishAvailableLocked()
         RememberFinishedLocked(key);
         expected_models_.erase(key);
         it = registered_since_.erase(it);
+        batch.dropped_frames.push_back(key);
+    }
+}
 
-        if (drop_cb) {
-            drop_cb(key.channel_id, key.frame_id);
+void FrameResultAggregator::DispatchPublishBatch(PublishBatch& batch)
+{
+    for (auto& frame : batch.ready_frames)
+    {
+        if (batch.on_frame_ready) {
+            batch.on_frame_ready(frame);
+        } else {
+            ReleaseFrame(frame.frame);
         }
+    }
+
+    if (!batch.on_frame_dropped) {
+        return;
+    }
+
+    for (const auto& key : batch.dropped_frames)
+    {
+        batch.on_frame_dropped(key.channel_id, key.frame_id);
     }
 }
 

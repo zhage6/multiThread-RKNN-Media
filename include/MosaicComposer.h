@@ -64,6 +64,8 @@ public:
 private:
     void ReleaseInput(MosaicInput& input);
     bool ReadyLocked() const;
+    bool CanStartPlayoutLocked(int64_t* start_pts_us,
+                               int64_t* available_lead_us) const;
     void FlowLoop();
     void ComposeLocked();
     void MaybeLogStatsLocked(const char* source);
@@ -83,6 +85,7 @@ private:
     int64_t next_mosaic_pts_us_ = -1;//当前要拼的媒体时间点
     int64_t mosaic_period_us_ = 0; //拼接周期
     int64_t sync_tolerance_us_ = 0; //允许某一路帧和 target_pts_us 差多少
+    int64_t playout_delay_us_ = 150000; //启动时预留的已聚合结果提前量
 
     std::unique_ptr<RkMppEncoder> encoder_;
     std::unique_ptr<StreamPublisher> publisher_;

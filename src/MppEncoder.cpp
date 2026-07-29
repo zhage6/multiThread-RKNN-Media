@@ -156,7 +156,7 @@ bool RkMppEncoder::Start()
     return true;
 }
 
-bool RkMppEncoder::PushBuffer(MppBuffer buffer) 
+bool RkMppEncoder::PushBuffer(MppBuffer buffer, int64_t input_submit_wall_ms)
 {
     if (buffer == nullptr) 
     {
@@ -180,9 +180,14 @@ bool RkMppEncoder::PushBuffer(MppBuffer buffer)
     // 绑定已经带有画框数据的物理内存
     mpp_frame_set_buffer(frame, buffer);
 
+    if (input_submit_wall_ms < 0) {
+        input_submit_wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
     {
         std::lock_guard<std::mutex> lock(mtx_);
-        pending_frames_.push_back(frame);
+        pending_frames_.push_back({frame, input_submit_wall_ms});
     }
 
     MPP_RET ret = mpi_->encode_put_frame(ctx_, frame);
@@ -223,7 +228,10 @@ void RkMppEncoder::OutputThreadFunc()
             
            if (!is_extra && size > 0 && on_packet_ready_) 
            {
-                on_packet_ready_((const uint8_t*)data, size, is_keyframe);
+                on_packet_ready_((const uint8_t*)data,
+                                 size,
+                                 is_keyframe,
+                                 PeekOldestPendingSubmitWallMs());
            }
 
             bool frame_done = true;
@@ -325,7 +333,7 @@ void RkMppEncoder::RemovePendingFrame(MppFrame frame)
     std::lock_guard<std::mutex> lock(mtx_);
     for (auto it = pending_frames_.begin(); it != pending_frames_.end(); ++it) 
     {
-        if (*it == frame) {
+        if (it->frame == frame) {
             pending_frames_.erase(it);
             return;
         }
@@ -342,12 +350,21 @@ bool RkMppEncoder::RecycleOldestPendingFrame()
             return false;
         }
 
-        frame = pending_frames_.front();
+        frame = pending_frames_.front().frame;
         pending_frames_.pop_front();
     }
 
     RecycleEncodedFrame(frame);
     return true;
+}
+
+int64_t RkMppEncoder::PeekOldestPendingSubmitWallMs()
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (pending_frames_.empty()) {
+        return -1;
+    }
+    return pending_frames_.front().input_submit_wall_ms;
 }
 
 void RkMppEncoder::Stop() 
@@ -369,7 +386,8 @@ void RkMppEncoder::Stop()
     // 4. 清理还在编码器内部排队的输入帧，并把 group 里取出的 buffer 归还
     {
         std::lock_guard<std::mutex> lock(mtx_);
-        for (auto frame : pending_frames_) {
+        for (auto& pending : pending_frames_) {
+            auto frame = pending.frame;
             if (frame) {
                 MppBuffer buffer = mpp_frame_get_buffer(frame);
                 mpp_frame_deinit(&frame);

@@ -207,6 +207,22 @@ namespace
         const int x = std::max(4, width - TextWidth(text, scale) - 24);
         DrawTextY(static_cast<uint8_t*>(ptr), stride, width, height, x, y, text, scale);
     }
+
+    void DrawPipelineAgeOverlayNv12(void* ptr, int width, int height, int stride,
+                                    int x, int y, int64_t age_ms)
+    {
+        if (!ptr || age_ms < 0) {
+            return;
+        }
+
+        char text[32];
+        const int64_t total_ms = std::max<int64_t>(0, age_ms);
+        snprintf(text, sizeof(text), "%02lld:%02lld.%03lld",
+                 static_cast<long long>((total_ms / 60000) % 100),
+                 static_cast<long long>((total_ms / 1000) % 60),
+                 static_cast<long long>(total_ms % 1000));
+        DrawTextY(static_cast<uint8_t*>(ptr), stride, width, height, x, y, text, 4);
+    }
 } // namespace
 MosaicComposer::MosaicComposer()
     : out_width_(0),
@@ -302,11 +318,13 @@ bool MosaicComposer::Init(int out_width, int out_height, int fps)
     stream_start_time_ = std::chrono::steady_clock::now();
     stats_last_ = stream_start_time_;
 
-    encoder_->SetOutputCallback([this](const uint8_t* data, size_t size, bool is_keyframe) {
+    encoder_->SetOutputCallback([this](const uint8_t* data, size_t size, bool is_keyframe,
+                                       int64_t compose_submit_wall_ms) {
         if (!publisher_ || data == nullptr || size == 0) 
         {
             return;
         }
+        const int64_t encoded_wall_ms = CurrentWallMs();
         const int fps = std::max(1, fps_);
         const uint64_t frame_index = packet_counter_++;
 
@@ -324,7 +342,17 @@ bool MosaicComposer::Init(int out_width, int out_height, int fps)
         last_packet_pts_ = packet.pts;
         packet.dts = packet.pts;
 
-        publisher_->Push(packet);
+        const bool push_ok = publisher_->Push(packet);
+        const int64_t rtsp_handoff_wall_ms = CurrentWallMs();
+        if (compose_submit_wall_ms >= 0) {
+            timing::Log(
+                "mosaic_rtsp_handoff packet=%llu compose_to_encode_ms=%lld compose_to_rtsp_ms=%lld rtsp_push_ms=%lld ok=%d",
+                static_cast<unsigned long long>(frame_index),
+                static_cast<long long>(encoded_wall_ms - compose_submit_wall_ms),
+                static_cast<long long>(rtsp_handoff_wall_ms - compose_submit_wall_ms),
+                static_cast<long long>(rtsp_handoff_wall_ms - encoded_wall_ms),
+                push_ok ? 1 : 0);
+        }
     });
 
     if (!encoder_->Start()) {
@@ -467,6 +495,36 @@ bool MosaicComposer::ReadyLocked() const
     }
     return true;
 }
+
+bool MosaicComposer::CanStartPlayoutLocked(int64_t* start_pts_us,
+                                            int64_t* available_lead_us) const
+{
+    int64_t max_first_pts = -1;
+    int64_t min_latest_pts = -1;
+
+    for (int ch = 0; ch < kChannels; ++ch) {
+        const auto& buffer = pts_buffers_[ch];
+        if (buffer.empty()) {
+            return false;
+        }
+
+        max_first_pts = std::max(max_first_pts, buffer.begin()->first);
+        const int64_t latest_pts = buffer.rbegin()->first;
+        min_latest_pts = min_latest_pts < 0
+                             ? latest_pts
+                             : std::min(min_latest_pts, latest_pts);
+    }
+
+    if (start_pts_us) {
+        *start_pts_us = max_first_pts;
+    }
+    if (available_lead_us) {
+        *available_lead_us = min_latest_pts - max_first_pts;
+    }
+
+    return min_latest_pts >= max_first_pts + playout_delay_us_;
+}
+
 bool MosaicComposer::SelectSyncedInputsLocked(int64_t target_pts_us,std::array<MosaicInput, kChannels>& selected)
     {
         for (int ch = 0; ch < kChannels; ++ch) 
@@ -870,30 +928,29 @@ RenderStats RenderModelResult(const ModelResult& result,
 void MosaicComposer::ComposeLocked()
 {
     constexpr bool kDrawDetections = true;
-    constexpr bool kDrawTimestamps = false;
+    constexpr bool kDrawTimestamps = true;
     if (!ReadyLocked()) {
         mosaic_not_ready_count_++;
         MaybeLogStatsLocked("mosaic_not_ready");
         return;
     }
-      // 1. 初始化 next_mosaic_pts_us_
+    // 启动时先积累一段已聚合结果，给较慢模型留出返回时间。
     if (next_mosaic_pts_us_ < 0) 
     {
-        int64_t max_first_pts = -1;
-
-        for (int ch = 0; ch < kChannels; ++ch) //确定要发布的帧的pts，取各通道最小的 pts 的最大值
-        {
-            if (pts_buffers_[ch].empty()) 
-            {
-                mosaic_not_ready_count_++;
-                MaybeLogStatsLocked("pts_not_ready");
-                return;
-            }
-
-            max_first_pts = std::max(max_first_pts, pts_buffers_[ch].begin()->first); 
+        int64_t start_pts_us = -1;
+        int64_t available_lead_us = 0;
+        if (!CanStartPlayoutLocked(&start_pts_us, &available_lead_us)) {
+            mosaic_not_ready_count_++;
+            MaybeLogStatsLocked("playout_buffering");
+            return;
         }
 
-        next_mosaic_pts_us_ = max_first_pts;
+        next_mosaic_pts_us_ = start_pts_us;
+        timing::Log(
+            "mosaic_playout_start target_pts=%lld lead_us=%lld delay_us=%lld",
+            static_cast<long long>(next_mosaic_pts_us_),
+            static_cast<long long>(available_lead_us),
+            static_cast<long long>(playout_delay_us_));
     }
     int64_t oldest_common_pts = -1;
     bool all_channels_have_buffer = true;
@@ -1133,6 +1190,13 @@ void MosaicComposer::ComposeLocked()
                                     overlay_y,
                                     input.origin_wall_ms);
             age_ms[i] = input.origin_wall_ms >= 0 ? compose_wall_ms - input.origin_wall_ms : -1;
+            DrawPipelineAgeOverlayNv12(dst_ptr,
+                                       out_width_,
+                                       out_height_,
+                                       out_hor_stride_,
+                                       overlay_x,
+                                       overlay_y + 48,
+                                       age_ms[i]);
         }
             timing::Log("mosaic_e2e_age_ms ch0=%lld ch1=%lld ch2=%lld ch3=%lld frame=%llu,%llu,%llu,%llu",
                 static_cast<long long>(age_ms[0]),
@@ -1164,7 +1228,8 @@ void MosaicComposer::ComposeLocked()
             static_cast<unsigned long long>(selected[2].frame_id),
             static_cast<unsigned long long>(selected[3].frame_id));
 
-   if (!encoder_ || !encoder_->PushBuffer(dst_buffer)) 
+    const int64_t compose_submit_wall_ms = CurrentWallMs();
+    if (!encoder_ || !encoder_->PushBuffer(dst_buffer, compose_submit_wall_ms))
     {
         printf("Mosaic encoder push failed\n");
         mpp_buffer_put(dst_buffer);

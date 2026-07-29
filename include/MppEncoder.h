@@ -20,7 +20,10 @@
 // data: 编码后的 H264/H265 码流指针
 // size: 码流大小
 // is_keyframe: 是否是 I 帧 (方便上层做推流时的关键帧判断)
-using PacketCallback = std::function<void(const uint8_t* data, size_t size, bool is_keyframe)>;
+// input_submit_wall_ms: 对应输入帧提交给编码器时的系统时间
+using PacketCallback = std::function<void(const uint8_t* data, size_t size,
+                                          bool is_keyframe,
+                                          int64_t input_submit_wall_ms)>;
 
 class RkMppEncoder 
 {
@@ -44,7 +47,7 @@ public:
     // 内部会从空闲队列取一个 DRM buffer，将数据拷贝进去，然后送给硬件
     bool PushFrame(const uint8_t* image_data, size_t data_size);//这个接口非0拷贝，不考虑使用
     
-    bool PushBuffer(MppBuffer buffer);
+    bool PushBuffer(MppBuffer buffer, int64_t input_submit_wall_ms = -1);
 
     void RecycleBuffer(MppBuffer buffer);
 
@@ -62,6 +65,7 @@ private:
     void RecycleEncodedFrame(MppFrame frame);
     void RemovePendingFrame(MppFrame frame);
     bool RecycleOldestPendingFrame();
+    int64_t PeekOldestPendingSubmitWallMs();
     void MaybeLogStats(const char* source);
 
 private:
@@ -69,6 +73,11 @@ private:
         int fd;
         void* ptr;
         size_t size;
+    };
+
+    struct PendingFrame {
+        MppFrame frame = nullptr;
+        int64_t input_submit_wall_ms = -1;
     };
 
     // MPP 核心上下文 (原 MpiEncTestData 中的核心成员)
@@ -105,7 +114,7 @@ private:
     std::atomic<uint64_t> recycled_frame_count_;
 
     // Buffer 管理：外部 DMA fd commit 到 MppBufferGroup，由 group 管空闲/占用
-    std::deque<MppFrame> pending_frames_;
+    std::deque<PendingFrame> pending_frames_;
     std::vector<EncoderExternalBuffer> external_buffers_;
     std::mutex mtx_;
     std::condition_variable cv_;
