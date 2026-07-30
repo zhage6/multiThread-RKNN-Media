@@ -98,7 +98,12 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    mosaic.Init(1920, 1080, 24);
+    if (!mosaic.Init(1920, 1080, 24))
+    {
+        printf("Mosaic/embedded RTSP initialization failed\n");
+        aggregator.Stop();
+        return -1;
+    }
     channels.push_back(std::make_unique<VideoChannel>(0, "../test.h264", &pipeline,active_channels, &mosaic));
     channels.push_back(std::make_unique<VideoChannel>(1, "../test2.h264", &pipeline,active_channels, &mosaic));
     channels.push_back(std::make_unique<VideoChannel>(2, "../test3.h264", &pipeline,active_channels, &mosaic));

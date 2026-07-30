@@ -14,8 +14,8 @@ set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--allow-shlib-undefine
 set(CMAKE_INSTALL_PREFIX ${CMAKE_SOURCE_DIR}/install/rknn_yolov5_demo_${CMAKE_SYSTEM_NAME})
 
 set(CMAKE_SKIP_INSTALL_RPATH FALSE)
-set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
-set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
+set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
+set(CMAKE_INSTALL_RPATH "$ORIGIN/lib")
 
 # rknn api
 set(RKNN_API_PATH ${CMAKE_SOURCE_DIR}/../../runtime/RK3588/${CMAKE_SYSTEM_NAME}/librknn_api)
@@ -43,13 +43,30 @@ find_package(OpenCV REQUIRED)
 
 include_directories(${OpenCV_INCLUDE_DIRS})
 
-# ffmpeg / libavformat for RTSP publisher
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil)
-include_directories(${FFMPEG_INCLUDE_DIRS})
-link_directories(${FFMPEG_LIBRARY_DIRS})
+# Embedded ZLMediaKit RTSP server
+set(ZLMEDIAKIT_ROOT "${CMAKE_SOURCE_DIR}/../ZLMediaKit" CACHE PATH
+    "Path to the ZLMediaKit source tree")
+set(ZLMEDIAKIT_API_INCLUDE "${ZLMEDIAKIT_ROOT}/api/include")
+set(ZLMEDIAKIT_API_LIBRARY
+    "${ZLMEDIAKIT_ROOT}/release/linux/Debug/libmk_api.so"
+    CACHE FILEPATH "Path to the ZLMediaKit C API shared library")
 
-set(CMAKE_INSTALL_RPATH "lib")
+if(NOT EXISTS "${ZLMEDIAKIT_API_INCLUDE}/mk_mediakit.h")
+    message(FATAL_ERROR
+        "ZLMediaKit API headers not found under ${ZLMEDIAKIT_API_INCLUDE}")
+endif()
+if(NOT EXISTS "${ZLMEDIAKIT_API_LIBRARY}")
+    message(FATAL_ERROR
+        "ZLMediaKit C API library not found: ${ZLMEDIAKIT_API_LIBRARY}")
+endif()
+
+add_library(zlmediakit_api SHARED IMPORTED)
+set_target_properties(zlmediakit_api PROPERTIES
+    IMPORTED_LOCATION "${ZLMEDIAKIT_API_LIBRARY}")
+
+get_filename_component(
+    ZLMEDIAKIT_API_LIBRARY_DIR "${ZLMEDIAKIT_API_LIBRARY}" DIRECTORY)
+set(CMAKE_BUILD_RPATH "${ZLMEDIAKIT_API_LIBRARY_DIR}")
 
 
 # rknn_yolov5_demo
@@ -66,17 +83,35 @@ add_executable(rknn_yolov5_demo
         src/MppEncoder.cpp
         src/StreamChannel.cpp
         src/MosaicComposer.cpp
+        src/ZlMediaPublisher.cpp
         src/FrameResultAggregator.cpp
         src/MultiModelPipeline.cpp
 )
+
+target_include_directories(rknn_yolov5_demo PRIVATE
+    "${ZLMEDIAKIT_API_INCLUDE}")
 
 target_link_libraries(rknn_yolov5_demo
   ${RKNN_RT_LIB}
   ${OpenCV_LIBS}
   ${RGA_LIB}
   ${MPP_LIB}
-  ${FFMPEG_LIBRARIES}
+  zlmediakit_api
 )
+
+option(BUILD_ZLMEDIAKIT_SMOKE_TEST
+    "Build the standalone embedded RTSP smoke test" OFF)
+if(BUILD_ZLMEDIAKIT_SMOKE_TEST)
+    add_executable(zlmedia_rtsp_smoke EXCLUDE_FROM_ALL
+        tests/zlmedia_rtsp_smoke.cpp
+        src/ZlMediaPublisher.cpp)
+    target_include_directories(zlmedia_rtsp_smoke PRIVATE
+        "${CMAKE_SOURCE_DIR}/include"
+        "${ZLMEDIAKIT_API_INCLUDE}")
+    target_link_libraries(zlmedia_rtsp_smoke
+        zlmediakit_api
+        pthread)
+endif()
 
 
 # install target and libraries
@@ -85,4 +120,5 @@ install(TARGETS rknn_yolov5_demo DESTINATION ./)
 install(PROGRAMS ${RKNN_RT_LIB} DESTINATION lib)
 install(PROGRAMS ${RGA_LIB} DESTINATION lib)
 install(PROGRAMS ${MPP_LIB} DESTINATION lib)
+install(PROGRAMS ${ZLMEDIAKIT_API_LIBRARY} DESTINATION lib)
 install(DIRECTORY model DESTINATION ./)

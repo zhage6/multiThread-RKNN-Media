@@ -1,6 +1,7 @@
 #include "StreamChannel.h"
 #include "TimingLogger.h"
 #include "MultiModelPipeline.h"
+#include "ZlMediaPublisher.h"
 #include <algorithm>
 #include <chrono>
 
@@ -93,7 +94,6 @@ void VideoChannel::start()
         {
             m_encoder_ready = true;
         }
-        m_input_start_time = std::chrono::steady_clock::now();
         if (m_throttle_local_input) 
         {
             timing::Log("local_input_throttle_enabled ch=%d fps=%d url=%s",
@@ -126,6 +126,17 @@ void VideoChannel::start()
             data.channel_id = this->m_channel_id;    // 贴上通道标签
             data.frame_id = this->m_frame_counter++; // 贴上序号标签(满了怎么办？)
             data.pts_us = pts_us;                        // 当前阶段没有真实 PTS，先保留字段
+
+            if (this->m_throttle_local_input && data.frame_id == 0)
+            {
+                // Start the local-file pacing clock from the first decoded
+                // frame. Decoder initialization must not create a time debt
+                // that makes the first frames run in a burst.
+                this->m_input_start_time = std::chrono::steady_clock::now();
+                timing::Log("local_input_clock_started ch=%d frame=%llu",
+                            this->m_channel_id,
+                            static_cast<unsigned long long>(data.frame_id));
+            }
 
             if (data.pts_us <= 0 && this->m_input_fps > 0) 
             {
@@ -271,16 +282,18 @@ void VideoChannel::DecodeLoop()
 void VideoChannel::InitEncoder(int width, int height, int h_stride, int v_stride, MppFrameFormat fmt)
 {
     m_encoder = new RkMppEncoder();
-    m_encoder->Init(width, height, h_stride, v_stride, fmt, MPP_VIDEO_CodingAVC);
+    m_encoder->Init(
+        width, height, h_stride, v_stride, fmt, MPP_VIDEO_CodingAVC,
+        m_output_fps);
     m_stream_start_time = std::chrono::steady_clock::now();
     std::vector<uint8_t> h264_header;
     if (!m_encoder->GetHeader(h264_header)) 
     {
         printf("获取 H264 SPS/PPS 失败\n");
     }
-   std::string rtsp_url =
-    "rtsp://127.0.0.1:8554/live/channel" + std::to_string(m_channel_id);
-    m_publisher.reset(new RtspPublisher());
+    std::string rtsp_url =
+        MakeEmbeddedRtspUrl("channel" + std::to_string(m_channel_id));
+    m_publisher.reset(new ZlMediaPublisher());
     if (!m_publisher->Init(rtsp_url, width, height, m_output_fps, h264_header.data(), h264_header.size())) 
     {
         printf("通道 %d RTSP 推流初始化失败: %s\n", m_channel_id, rtsp_url.c_str());

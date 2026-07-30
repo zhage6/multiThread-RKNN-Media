@@ -1,4 +1,5 @@
 #include "MosaicComposer.h"
+#include "ZlMediaPublisher.h"
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -270,7 +271,8 @@ bool MosaicComposer::Init(int out_width, int out_height, int fps)
                         out_hor_stride_,
                         out_ver_stride_,
                         MPP_FMT_YUV420SP,
-                        MPP_VIDEO_CodingAVC)) 
+                        MPP_VIDEO_CodingAVC,
+                        fps_))
     {
         printf("Mosaic encoder init failed\n");
         ReleaseOutputBuffers();
@@ -282,14 +284,15 @@ bool MosaicComposer::Init(int out_width, int out_height, int fps)
         printf("Mosaic encoder get header failed\n");
     }
 
-    publisher_ = std::make_unique<RtspPublisher>();
-    if (!publisher_->Init("rtsp://127.0.0.1:8554/live/mosaic",
+    publisher_ = std::make_unique<ZlMediaPublisher>();
+    const std::string rtsp_url = MakeEmbeddedRtspUrl("mosaic");
+    if (!publisher_->Init(rtsp_url,
                         out_width_,
                         out_height_,
                         fps_,
                         h264_header.data(),
                         h264_header.size())) {
-        printf("Mosaic RTSP publisher init failed\n");
+        printf("Mosaic embedded ZLMediaKit RTSP init failed\n");
         encoder_->Stop();
         encoder_.reset();
         ReleaseOutputBuffers();

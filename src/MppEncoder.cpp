@@ -36,7 +36,13 @@ RkMppEncoder::~RkMppEncoder()
 {
     Stop();
 }
-bool RkMppEncoder::Init(int width, int height,int hor_stride, int ver_stride, MppFrameFormat fmt, MppCodingType type)
+bool RkMppEncoder::Init(int width,
+                        int height,
+                        int hor_stride,
+                        int ver_stride,
+                        MppFrameFormat fmt,
+                        MppCodingType type,
+                        int fps)
 {
     width_ = width;
     height_ = height;
@@ -86,8 +92,8 @@ bool RkMppEncoder::Init(int width, int height,int hor_stride, int ver_stride, Mp
     mpp_enc_cfg_set_s32(cfg_, "prep:format", fmt);
 
     // --- 码率控制配置 (RC: Rate Control) ---
-    int fps_in = 30;
-    int fps_out = 30;
+    int fps_in = std::max(1, fps);
+    int fps_out = fps_in;
     int bps = width * height * fps_out * 0.1 *1; // 这是一个粗略的码率估算公式，可自定义
     
     // 设置 CBR (固定码率) 或 VBR (动态码率)
@@ -109,7 +115,7 @@ bool RkMppEncoder::Init(int width, int height,int hor_stride, int ver_stride, Mp
     // --- 编码器特性配置 (Codec) ---
     // 例如设置 H.264 的 Profile，或者设置 GOP 大小 (关键帧间隔)
     mpp_enc_cfg_set_s32(cfg_, "codec:type", type);
-    mpp_enc_cfg_set_s32(cfg_, "rc:gop", fps_out * 2); // 每两秒一个 I 帧 (GOP=60)
+    mpp_enc_cfg_set_s32(cfg_, "rc:gop", 6); // 每两秒一个 I 帧fps_out * 2
 
     // 4. 【最关键的一步】将配置好的 cfg 下发给硬件！
     ret = mpi_->control(ctx_, MPP_ENC_SET_CFG, cfg_);
@@ -312,7 +318,7 @@ void RkMppEncoder::MaybeLogStats(const char* source)
 
     double seconds = elapsed_ms / 1000.0;
     timing::Log("encoder_health source=%s in_fps=%.2f packet_fps=%.2f frame_fps=%.2f recycle_fps=%.2f pending=%zu total_in=%llu total_frames=%llu",
-                source ? source : "unknown",
+                source ? source : "unknown", 
                 (in - stats_last_in_) / seconds,
                 (packets - stats_last_packet_) / seconds,
                 (frames - stats_last_frame_) / seconds,
