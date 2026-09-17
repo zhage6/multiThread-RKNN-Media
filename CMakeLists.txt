@@ -41,6 +41,13 @@ include_directories(${MPP_PATH})
 set(OpenCV_DIR "${CMAKE_SOURCE_DIR}/include/3rdparty/opencv_arm64/lib/cmake/opencv4")
 find_package(OpenCV REQUIRED)
 
+# FFmpeg only demuxes network H.264 input; MPP still performs hardware decode.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+    libavformat
+    libavcodec
+    libavutil)
+
 include_directories(${OpenCV_INCLUDE_DIRS})
 
 # Embedded ZLMediaKit RTSP server
@@ -79,6 +86,7 @@ add_executable(rknn_yolov5_demo
         src/preprocess.cc
         src/rkYolov5s.cc
         src/MppDecoder.cpp
+        src/FfmpegH264Source.cpp
         src/dma_alloc.cpp
         src/MppEncoder.cpp
         src/StreamChannel.cpp
@@ -96,6 +104,7 @@ target_link_libraries(rknn_yolov5_demo
   ${OpenCV_LIBS}
   ${RGA_LIB}
   ${MPP_LIB}
+  PkgConfig::FFMPEG
   zlmediakit_api
 )
 

@@ -118,7 +118,7 @@ namespace dpool
                         {
                             --currentThreads_;
                             return;
-                        }
+                        } 
                         if (hasTimedout)
                         {
                             --currentThreads_;

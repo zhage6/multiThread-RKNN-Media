@@ -27,9 +27,10 @@ namespace dpool
 int main(int argc, char **argv)
 {
     char *model_name = NULL;
-    if (argc != 3)
+    if (argc != 3 && argc != 7)
     {
-        printf("Usage: %s <rknn model> <jpg> \n", argv[0]);
+        printf("Usage: %s <yolo.rknn> <face_yolo.rknn> [input0 input1 input2 input3]\n", argv[0]);
+        printf("Input may be a local Annex-B .h264 file or an RTSP/RTMP/HTTP H.264 URL.\n");
         return -1;
     }
     // 参数二，模型所在路径/The path where the model is located
@@ -104,10 +105,20 @@ int main(int argc, char **argv)
         aggregator.Stop();
         return -1;
     }
-    channels.push_back(std::make_unique<VideoChannel>(0, "../test.h264", &pipeline,active_channels, &mosaic));
-    channels.push_back(std::make_unique<VideoChannel>(1, "../test2.h264", &pipeline,active_channels, &mosaic));
-    channels.push_back(std::make_unique<VideoChannel>(2, "../test3.h264", &pipeline,active_channels, &mosaic));
-    channels.push_back(std::make_unique<VideoChannel>(3, "../test4.h264", &pipeline,active_channels, &mosaic));
+    std::vector<std::string> input_urls = {
+        "../test.h264", "../test2.h264", "../test3.h264", "../test4.h264"
+    };
+    if (argc == 7) 
+    {
+        for (int i = 0; i < 4; ++i) 
+        {
+            input_urls[i] = argv[i + 3];
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        channels.push_back(std::make_unique<VideoChannel>(
+            i, input_urls[i], &pipeline, active_channels, &mosaic));
+    }
 //    channels.push_back(std::make_unique<VideoChannel>(4, "../test5.h264", &yolo,active_channels, &mosaic));
 //    channels.push_back(std::make_unique<VideoChannel>(5, "../test6.h264", &yolo,active_channels, &mosaic));
     

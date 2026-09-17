@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <map>
 #include <functional>
 
@@ -43,8 +44,10 @@ public:
     // 1. 初始化解码器环境 (传入回调函数与视频格式，默认 H.264)
     bool Init(FrameCallback callback, MppCodingType type = MPP_VIDEO_CodingAVC);
 
-    // 2. 核心数据输入接口：无论是读本地文件还是网络推流，拿到 H264 裸流直接往这里喂
-    void DecodePacket(const uint8_t* data, size_t size);
+    // 2. 核心数据输入接口：无论是读本地文件还是网络推流，拿到 H264 裸流直接往这里喂。
+    // pts_us is propagated to MppFrame so downstream PTS synchronization can
+    // use the source stream clock instead of a locally generated frame index.
+    void DecodePacket(const uint8_t* data, size_t size, int64_t pts_us = -1);
 
     // 内部处理：处理硬件解码循环
     void FlushDecoder();
@@ -76,6 +79,7 @@ private:
     int             m_src_height;
     int             m_hor_stride;
     int             m_ver_stride;
+    uint64_t        m_buffer_stat_counter;
 
 public:
     // 缓存映射表：通过 fd 快速查找对应的 RGA 输入缓冲结构体

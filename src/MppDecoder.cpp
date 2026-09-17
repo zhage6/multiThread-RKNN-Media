@@ -5,7 +5,8 @@
 // --- 构造函数：全部初始化为空 ---
 MppDecoder::MppDecoder() : 
     m_ctx(nullptr), m_mpi(nullptr), m_frm_grp(nullptr),
-    m_initialized(false), m_src_width(0), m_src_height(0) 
+    m_initialized(false), m_src_width(0), m_src_height(0),
+    m_buffer_stat_counter(0)
 {
     
 }
@@ -147,7 +148,7 @@ int MppDecoder::AllocateExternalBuffers(size_t buf_size, int width, int height)
 }
 
 // --- 核心加工接口：处理每一包 H.264 数据 ---
-void MppDecoder::DecodePacket(const uint8_t* data, size_t size) 
+void MppDecoder::DecodePacket(const uint8_t* data, size_t size, int64_t pts_us)
 {
     if (!m_initialized || !data || size == 0) return;
 
@@ -155,6 +156,9 @@ void MppDecoder::DecodePacket(const uint8_t* data, size_t size)
     mpp_packet_init(&packet, (void*)data, size);
     mpp_packet_set_pos(packet, (void*)data);
     mpp_packet_set_length(packet, size);
+    if (pts_us >= 0) {
+        mpp_packet_set_pts(packet, pts_us);
+    }
 
     // ==========================================
     // 核心修复：加入背压重试机制（防止 CPU 把硬件撑爆）
@@ -243,10 +247,27 @@ void MppDecoder::FlushDecoder()
                 // otherwise the external decoder buffer pool will be exhausted.
                 mpp_frame_deinit(&frame);
                 frame = nullptr;
+
+                if (m_frm_grp && ++m_buffer_stat_counter % 24 == 0)
+                {
+                    const RK_S32 unused = mpp_buffer_group_unused(m_frm_grp);
+                    const size_t total = buffer_map.size();
+                    const long long busy = unused >= 0
+                        ? static_cast<long long>(total) - unused
+                        : -1;
+                    const size_t usage = mpp_buffer_group_usage(m_frm_grp);
+
+                    printf("Decoder[%p] buffers: total=%zu busy=%lld unused=%d usage=%.2f MiB\n",
+                           static_cast<void*>(this),
+                           total,
+                           busy,
+                           static_cast<int>(unused),
+                           usage / 1024.0 / 1024.0);
+                }
             }
             else 
             {
-                mpp_frame_deinit(&frame); // 废废帧当场释放
+                mpp_frame_deinit(&frame); // 废帧当场释放
             }
         }
     }

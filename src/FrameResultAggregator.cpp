@@ -244,7 +244,7 @@ void FrameResultAggregator::WorkerLoop()
             if (has_output) {
                 AddResult(std::move(output));
             }
-            PublishAvailableLocked(publish_batch);
+            PublishAvailableLocked(publish_batch); //最核心的遍历环节，遍历pendding ，requiremodels
 
             RecordWorkerLockHold(timing::UsSince(lock_hold_start));
             should_log_lock_stats = TakeLockStatsLocked(lock_stats);
@@ -384,15 +384,15 @@ void FrameResultAggregator::AddResult(ModelOutput output)
         ReleaseFrame(output.frame);
     }
 }
-
+//在这个函数中要遍历多个内容
 void FrameResultAggregator::PublishAvailableLocked(PublishBatch& batch)
 {
     auto now = std::chrono::steady_clock::now();
 
-    for (auto it = pending_.begin(); it != pending_.end();)
+    for (auto it = pending_.begin(); it != pending_.end();) //遍历pedding列表
     {
         const FrameKey key = it->first;
-        const bool ready = HasRequiredResultsLocked(key, it->second);
+        const bool ready = HasRequiredResultsLocked(key, it->second); //遍历注册过的require_models列表
         const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - it->second.first_seen);
         const bool timed_out = waited >= timeout_;

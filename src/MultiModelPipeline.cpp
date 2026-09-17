@@ -10,7 +10,8 @@ MultiModelPipeline::MultiModelPipeline()
 
 void MultiModelPipeline::AddModel(IModelAdapter* model, uint32_t frame_interval)
 {
-    if (model) {
+    if (model) 
+    {
         ModelEntry entry;
         entry.model = model;
         entry.frame_interval = std::max(1u, frame_interval);

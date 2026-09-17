@@ -201,7 +201,8 @@ int rkYolov5s::init(rknn_context *ctx_in, bool share_weight, int core_id)
     }
     
     ret = rknn_set_io_mem(ctx, input_mems[0], &input_attrs[0]);
-    if (ret < 0) {
+    if (ret < 0) 
+    {
         printf("input_mems rknn_set_io_mem fail! ret=%d\n", ret);
         rknn_destroy_mem(ctx, input_mems[0]);
         input_mems[0] = nullptr;

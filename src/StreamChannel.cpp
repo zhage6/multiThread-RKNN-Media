@@ -2,6 +2,7 @@
 #include "TimingLogger.h"
 #include "MultiModelPipeline.h"
 #include "ZlMediaPublisher.h"
+#include "FfmpegH264Source.h"
 #include <algorithm>
 #include <chrono>
 
@@ -36,6 +37,11 @@ namespace
                url.rfind("rtmp://", 0) != 0 &&
                url.rfind("http://", 0) != 0 &&
                url.rfind("https://", 0) != 0;
+    }
+
+    bool is_network_stream_url(const std::string& url)
+    {
+        return !is_local_stream_url(url);
     }
 
     int64_t current_wall_ms()
@@ -233,6 +239,39 @@ void VideoChannel::Stop()
 
 void VideoChannel::DecodeLoop()
 {
+    if (is_network_stream_url(m_stream_url)) {
+        DecodeNetworkInput();
+    } else {
+        DecodeFileInput();
+    }
+    printf("通道 %d 解码线程结束。\n", m_channel_id);
+    m_active_count--;
+}
+
+bool VideoChannel::WaitForDecodeCapacity()
+{
+    while (m_running)
+    {
+        const int max_inflight = m_encoder_ready.load()
+            ? m_max_inflight_frames
+            : m_startup_max_inflight_frames;
+
+        if (m_inflight_frames.load() < max_inflight) {
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    while (m_running && m_pipeline && m_pipeline->PendingCount() >= 40)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return m_running;
+}
+
+void VideoChannel::DecodeFileInput()
+{
     FILE* fp = fopen(m_stream_url.c_str(), "rb");
     if (!fp) 
     {
@@ -242,29 +281,7 @@ void VideoChannel::DecodeLoop()
     unsigned char buffer[4096];
     while (m_running && !feof(fp)) 
     {
-        while (m_running)
-        {
-            int max_inflight = m_encoder_ready.load()//如果编码器还没开始，即消费者还没启动，那么让该线程睡。少读取数据
-                ? m_max_inflight_frames
-                : m_startup_max_inflight_frames;
-
-            if (m_inflight_frames.load() < max_inflight) 
-            {
-                break;
-            }
-            
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
-
-        while (m_running && m_pipeline && m_pipeline->PendingCount() >= 40)  //临时控速 //这个是推理池子
-        {
-        // 如果池子满了，强行让当前读取线程睡 5 毫秒
-        // 这样就不会继续往外吐 frame，MPP 解码器也就停下来了，内存涨幅瞬间停止！
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
-        if (!m_running) 
-        {
+        if (!WaitForDecodeCapacity()) {
             break;
         }
         size_t bytes_read = fread(buffer, 1, sizeof(buffer), fp);
@@ -276,8 +293,53 @@ void VideoChannel::DecodeLoop()
         }
     }
     fclose(fp);
-    printf("通道 %d 解码线程结束。\n", m_channel_id);
-    m_active_count--;
+}
+
+void VideoChannel::DecodeNetworkInput()
+{
+    while (m_running)
+    {
+        FfmpegH264Source source;
+        if (!source.Open(m_stream_url)) {
+            if (m_running) {
+                printf("通道 %d 打开网络视频失败，1 秒后重试。\n", m_channel_id);
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+            continue;
+        }
+
+        while (m_running)
+        {
+            const FfmpegH264Source::ReadStatus status = source.ReadNext(
+                [this](const uint8_t* data, size_t size, int64_t pts_us)
+                {
+                    if (!WaitForDecodeCapacity()) {
+                        return false;
+                    }
+                    m_decoder->DecodePacket(data, size, pts_us);
+                    return m_running.load();
+                });
+
+            if (status == FfmpegH264Source::ReadStatus::kPacket) {
+                continue;
+            }
+            if (status == FfmpegH264Source::ReadStatus::kAgain) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            if (status == FfmpegH264Source::ReadStatus::kStopped || !m_running) {
+                return;
+            }
+
+            printf("通道 %d 网络视频读取中断，重新连接。\n", m_channel_id);
+            break;
+        }
+
+        source.Close();
+        if (m_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
 }
 void VideoChannel::InitEncoder(int width, int height, int h_stride, int v_stride, MppFrameFormat fmt)
 {

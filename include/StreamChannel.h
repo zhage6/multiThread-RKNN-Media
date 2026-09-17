@@ -48,6 +48,9 @@ class VideoChannel
 
     private: 
         void DecodeLoop();
+        void DecodeFileInput();
+        void DecodeNetworkInput();
+        bool WaitForDecodeCapacity();
         void InitEncoder(int width, int height, int h_stride, int v_stride, MppFrameFormat fmt);
         void EncodeZeroCopy(const InferOutput& out);
 

@@ -77,7 +77,6 @@ private:
     bool SelectSyncedInputsLocked(int64_t target_pts_us,std::array<MosaicInput, kChannels>& selected);
     void PruneExpiredInputsLocked(int64_t target_pts_us);
     std::mutex mtx_;
-    std::array<MosaicInput, kChannels> latest_;
 
     std::array<std::map<int64_t, MosaicInput>, kChannels> pts_buffers_; //缓存到达的帧
     std::array<MosaicInput, kChannels> last_synced_; //缓存发出的上一帧
@@ -114,6 +113,8 @@ private:
     uint64_t stats_last_push_count_ = 0;
     uint64_t stats_last_busy_drop_count_ = 0;
     std::array<uint64_t, kChannels> submit_count_ {};
+    std::array<uint64_t, kChannels> latest_frame_id_ {};
+    std::array<int64_t, kChannels> latest_pts_us_ {{-1, -1, -1, -1}};
     std::chrono::steady_clock::time_point stats_last_;
     std::thread flow_thread_;
     std::condition_variable flow_cv_;

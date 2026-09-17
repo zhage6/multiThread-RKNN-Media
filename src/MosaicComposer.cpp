@@ -240,7 +240,6 @@ MosaicComposer::~MosaicComposer()
 }
 
 
-
 bool MosaicComposer::Init(int out_width, int out_height, int fps)
 {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -430,7 +429,13 @@ void MosaicComposer::Stop()
 
     std::lock_guard<std::mutex> lock(mtx_);
 
-    for (auto& input : latest_) {
+    for (auto& buffer : pts_buffers_) {
+        for (auto& entry : buffer) {
+            ReleaseInput(entry.second);
+        }
+        buffer.clear();
+    }
+    for (auto& input : last_synced_) {
         ReleaseInput(input);
     }
     for (auto& cache : reusable_model_results_) {
@@ -663,7 +668,9 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
     }
 
     std::lock_guard<std::mutex> lock(mtx_);
-    submit_count_[ctx.channel_id]++;
+    submit_count_[ctx.channel_id]++; //日志统计
+    latest_frame_id_[ctx.channel_id] = ctx.frame_id;
+    latest_pts_us_[ctx.channel_id] = ctx.pts_us;
 
     if (!initialized_) {
         if (ctx.src_buffer) {
@@ -672,24 +679,19 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
         return;
     }
 
-    MosaicInput& slot = latest_[ctx.channel_id];
-    if (slot.valid) 
-    {
-        ReleaseInput(slot);
-    }
-
-    slot.valid = true;
-    slot.channel_id = ctx.channel_id;
-    slot.frame_id = ctx.frame_id;
-    slot.pts_us = ctx.pts_us;
-    slot.origin_wall_ms = ctx.origin_wall_ms;
-    slot.src_buffer = ctx.src_buffer;
-    slot.src_fd = ctx.src_fd;
-    slot.width = ctx.width;
-    slot.height = ctx.height;
-    slot.hor_stride = ctx.hor_stride;
-    slot.ver_stride = ctx.ver_stride;
-    slot.model_results = frame.results;
+    MosaicInput input;
+    input.valid = true;
+    input.channel_id = ctx.channel_id;
+    input.frame_id = ctx.frame_id;
+    input.pts_us = ctx.pts_us;
+    input.origin_wall_ms = ctx.origin_wall_ms;
+    input.src_buffer = ctx.src_buffer;
+    input.src_fd = ctx.src_fd;
+    input.width = ctx.width;
+    input.height = ctx.height;
+    input.hor_stride = ctx.hor_stride;
+    input.ver_stride = ctx.ver_stride;
+    input.model_results = frame.results;
 
     for (const auto& result : frame.results) {
         if (result.ok && result.model_id == "face_yolo") {
@@ -698,7 +700,7 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
     }
 
     bool has_face_result = false;
-    for (const auto& result : slot.model_results) {
+    for (const auto& result : input.model_results) {
         if (result.model_id == "face_yolo") 
         {
             has_face_result = true;
@@ -709,7 +711,7 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
     if (!has_face_result) {
         auto cached = reusable_model_results_[ctx.channel_id].find("face_yolo");
         if (cached != reusable_model_results_[ctx.channel_id].end()) {
-            slot.model_results.push_back(cached->second);
+            input.model_results.push_back(cached->second);
         }
     }
 
@@ -737,31 +739,25 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
     // 先兼容 YOLO：从 composed results 里找 Detection 结果
 
     
-    memset(&slot.results, 0, sizeof(slot.results));
+    memset(&input.results, 0, sizeof(input.results));
     for (const auto& result : frame.results) {
         if (result.type == ModelResultType::Detection && result.ok) {
-            slot.results = result.detections;
+            input.results = result.detections;
             break;
         }
     }
-     if (ctx.pts_us >= 0)
+    if (ctx.pts_us >= 0)//按照pts放入通道
     {
-        MosaicInput buffered = slot;
-        if (buffered.src_buffer) 
-        {
-            mpp_buffer_inc_ref(buffered.src_buffer);
-        }
-
         auto& buffer = pts_buffers_[ctx.channel_id];
 
         auto old = buffer.find(ctx.pts_us);
         if (old != buffer.end()) {
             ReleaseInput(old->second);
-            old->second = buffered;
+            old->second = std::move(input);
         } 
         else
         {
-            buffer.emplace(ctx.pts_us, buffered);
+            buffer.emplace(ctx.pts_us, std::move(input));
         }
 
         while (buffer.size() > 8) 
@@ -769,6 +765,10 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
             ReleaseInput(buffer.begin()->second); 
             buffer.erase(buffer.begin());
         }
+    }
+    else
+    {
+        ReleaseInput(input);
     }
 
 
@@ -1283,14 +1283,14 @@ void MosaicComposer::MaybeLogStatsLocked(const char* source)
                 static_cast<unsigned long long>(mosaic_compose_count_),
                 static_cast<unsigned long long>(mosaic_push_count_),
                 static_cast<unsigned long long>(mosaic_rga_fail_count_),
-                static_cast<unsigned long long>(latest_[0].frame_id),
-                static_cast<unsigned long long>(latest_[1].frame_id),
-                static_cast<unsigned long long>(latest_[2].frame_id),
-                static_cast<unsigned long long>(latest_[3].frame_id),
-                static_cast<long long>(latest_[0].pts_us),
-                static_cast<long long>(latest_[1].pts_us),
-                static_cast<long long>(latest_[2].pts_us),
-                static_cast<long long>(latest_[3].pts_us));
+                static_cast<unsigned long long>(latest_frame_id_[0]),
+                static_cast<unsigned long long>(latest_frame_id_[1]),
+                static_cast<unsigned long long>(latest_frame_id_[2]),
+                static_cast<unsigned long long>(latest_frame_id_[3]),
+                static_cast<long long>(latest_pts_us_[0]),
+                static_cast<long long>(latest_pts_us_[1]),
+                static_cast<long long>(latest_pts_us_[2]),
+                static_cast<long long>(latest_pts_us_[3]));
 
     stats_last_ = now;
     stats_last_submit_total_ = submit_total;
