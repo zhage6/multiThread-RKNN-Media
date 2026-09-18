@@ -1,36 +1,13 @@
 #include "StreamChannel.h"
 #include "TimingLogger.h"
 #include "MultiModelPipeline.h"
-#include "ZlMediaPublisher.h"
 #include "FfmpegH264Source.h"
+#include "rkYolov5s.hpp"
 #include <algorithm>
 #include <chrono>
 
 namespace 
 {
-    void release_source_buffer(const InferOutput& out)
-    {
-        if (out.src_buffer) 
-        {
-            mpp_buffer_put(out.src_buffer);
-        }
-    }
-
-    int clamp_to_range(int value, int low, int high)
-    {
-        return std::max(low, std::min(value, high));
-    }
-
-    int align_down_even(int value)
-    {
-        return value & ~1;
-    }
-
-    int align_up_even(int value)
-    {
-        return (value + 1) & ~1;
-    }
-
     bool is_local_stream_url(const std::string& url)
     {
         return url.rfind("rtsp://", 0) != 0 &&
@@ -52,24 +29,17 @@ namespace
 } // namespace
 
 VideoChannel::VideoChannel(int channel_id, const std::string& stream_url, 
-                    MultiModelPipeline* pipeline,std::atomic<int>& active_cnt, MosaicComposer* mosaic)
+                    MultiModelPipeline* pipeline, std::atomic<int>& active_cnt)
         : m_channel_id(channel_id), 
           m_stream_url(stream_url), 
           m_pipeline(pipeline),
           m_running(false),
           m_frame_counter(0),
           m_active_count(active_cnt),
-          m_mosaic(mosaic),
-          m_encoder(nullptr),
-          m_encode_packet_counter(0),
-          m_last_packet_pts(-1),
-          m_output_fps(24),
           m_throttle_local_input(is_local_stream_url(stream_url)),
           m_input_fps(24),
           m_inflight_frames(0),
-          m_max_inflight_frames(8),   //每路最大帧
-          m_encoder_ready(false),
-          m_startup_max_inflight_frames(2)
+          m_max_inflight_frames(8)   //每路最大帧
 {
     // 实例化该通道专属的 MPP 解码器
     m_decoder = new MppDecoder();
@@ -82,24 +52,12 @@ VideoChannel::~VideoChannel()
         delete m_decoder;
         m_decoder = nullptr;
     }
-    if (m_encoder) 
-    { 
-        delete m_encoder; 
-        m_encoder = nullptr; 
-    }
-    if (m_publisher) {
-        m_publisher->Close();
-    }
 }
 
 void VideoChannel::start()
 {
     if(m_running) return;
         m_running = true;
-        if (m_mosaic)
-        {
-            m_encoder_ready = true;
-        }
         if (m_throttle_local_input) 
         {
             timing::Log("local_input_throttle_enabled ch=%d fps=%d url=%s",
@@ -118,17 +76,12 @@ void VideoChannel::start()
                 mpp_buffer_inc_ref(data.src_buffer); //后面的fd还需要继续的进行RGA，暂时不要释放
             }
 
-            // if (m_encoder == nullptr) 
-            // {
-            //     InitEncoder(w, h, h_stride, v_stride, MPP_FMT_YUV420SP);
-            // }
             data.width = w;
             data.height = h;
             data.hor_stride = h_stride;
             data.ver_stride = v_stride;
             // MppDecoder owns and releases MppFrame after this callback returns.
             // Async stages keep the image alive through data.src_buffer instead.
-            data.frame = nullptr;
             data.channel_id = this->m_channel_id;    // 贴上通道标签
             data.frame_id = this->m_frame_counter++; // 贴上序号标签(满了怎么办？)
             data.pts_us = pts_us;                        // 当前阶段没有真实 PTS，先保留字段
@@ -168,13 +121,9 @@ void VideoChannel::start()
             // 塞入全局共享的 RKNN 线程池！
             // 注意：如果池子满了，你的 m_pool->put 会阻塞，这天然形成了对当前解码线程的“反压”
             printf("一帧解码完成\n");
-            int max_inflight = 0;
+            const int max_inflight = m_max_inflight_frames;
             while (m_running)
             {
-                max_inflight = m_encoder_ready.load()
-                    ? m_max_inflight_frames
-                    : m_startup_max_inflight_frames;
-
                 if (m_inflight_frames.load() < max_inflight) {
                     break;
                 }
@@ -230,7 +179,6 @@ void VideoChannel::start()
 void VideoChannel::Stop() 
 {
     m_running = false;
-    m_encoder_ready = false;
 
     if (m_decode_thread.joinable()) {
         m_decode_thread.join();
@@ -252,11 +200,7 @@ bool VideoChannel::WaitForDecodeCapacity()
 {
     while (m_running)
     {
-        const int max_inflight = m_encoder_ready.load()
-            ? m_max_inflight_frames
-            : m_startup_max_inflight_frames;
-
-        if (m_inflight_frames.load() < max_inflight) {
+        if (m_inflight_frames.load() < m_max_inflight_frames) {
             break;
         }
 
@@ -288,7 +232,7 @@ void VideoChannel::DecodeFileInput()
         if (bytes_read > 0) 
         {
             // 喂给当前通道的 MPP 解码器
-            // 它内部只要解出来，就会自动调用上面那个 Lambda 回调，扔进 testPool
+            // 解出帧后由回调交给 MultiModelPipeline。
             m_decoder->DecodePacket(buffer, bytes_read);
         }
     }
@@ -341,136 +285,6 @@ void VideoChannel::DecodeNetworkInput()
         }
     }
 }
-void VideoChannel::InitEncoder(int width, int height, int h_stride, int v_stride, MppFrameFormat fmt)
-{
-    m_encoder = new RkMppEncoder();
-    m_encoder->Init(
-        width, height, h_stride, v_stride, fmt, MPP_VIDEO_CodingAVC,
-        m_output_fps);
-    m_stream_start_time = std::chrono::steady_clock::now();
-    std::vector<uint8_t> h264_header;
-    if (!m_encoder->GetHeader(h264_header)) 
-    {
-        printf("获取 H264 SPS/PPS 失败\n");
-    }
-    std::string rtsp_url =
-        MakeEmbeddedRtspUrl("channel" + std::to_string(m_channel_id));
-    m_publisher.reset(new ZlMediaPublisher());
-    if (!m_publisher->Init(rtsp_url, width, height, m_output_fps, h264_header.data(), h264_header.size())) 
-    {
-        printf("通道 %d RTSP 推流初始化失败: %s\n", m_channel_id, rtsp_url.c_str());
-    }
-    m_encoder->SetOutputCallback([this](const uint8_t* data, size_t size, bool is_keyframe,
-                                        int64_t)
-    {
-        printf("编码器编码完成一帧\n");
-        auto callback_start = timing::Clock::now();
-        const int fps = std::max(1, m_output_fps);
-        const uint64_t frame_index = m_encode_packet_counter++;
-
-        auto target_time = m_stream_start_time +
-            std::chrono::microseconds(frame_index * 1000000 / fps);
-        auto before_sleep = timing::Clock::now();
-        long long wait_us = timing::UsBetween(before_sleep, target_time);
-        std::this_thread::sleep_until(target_time);
-        auto after_sleep = timing::Clock::now();
-        long long late_us = timing::UsBetween(target_time, after_sleep);
-
-        EncodedPacket packet;
-        packet.channel_id = m_channel_id;
-        packet.data = data;
-        packet.size = size;
-        packet.keyframe = is_keyframe;
-        packet.pts = static_cast<int64_t>(frame_index * 90000 / fps);
-        if (packet.pts <= m_last_packet_pts) {
-            packet.pts = m_last_packet_pts + 1;
-        }
-        m_last_packet_pts = packet.pts;
-        packet.dts = packet.pts;//时间戳
-        auto push_start = timing::Clock::now();
-        bool push_ok = false;
-        if (m_publisher) {
-            push_ok = m_publisher->Push(packet);
-        }
-        auto push_end = timing::Clock::now();
-        timing::Log("packet_push ch=%d enc_frame=%llu size=%zu key=%d pts=%lld wait_us=%lld late_us=%lld push_us=%lld callback_us=%lld ok=%d",
-                    m_channel_id,
-                    static_cast<unsigned long long>(frame_index),
-                    size,
-                    is_keyframe ? 1 : 0,
-                    static_cast<long long>(packet.pts),
-                    wait_us > 0 ? wait_us : 0,
-                    late_us > 0 ? late_us : 0,
-                    timing::UsBetween(push_start, push_end),
-                    timing::UsBetween(callback_start, push_end),
-                    push_ok ? 1 : 0);
-    });
-
-    m_encoder->Start();
-    m_encoder_ready = true;
-    printf("\n通道 %d 的硬件编码器启动成功！\n", m_channel_id);
-    
-}
-
-void VideoChannel::EncodeZeroCopy(const InferOutput& out) 
-{
-    IM_STATUS status;
-    auto total_start = timing::Clock::now();
-    if (out.src_buffer == nullptr || out.src_fd < 0) 
-    {
-        timing::Log("encode_input_drop ch=%d frame=%llu reason=bad_src",
-                    m_channel_id,
-                    static_cast<unsigned long long>(out.frame_id));
-        release_source_buffer(out);
-        return;
-    }
-    rga_buffer_t img = wrapbuffer_fd(out.src_fd, out.width, out.height,
-                                 RK_FORMAT_YCbCr_420_SP,
-                                 out.hor_stride, out.ver_stride);
-
-    //利用RGA在结果上帮忙画图
-    int drawn_boxes = 0;
-    auto draw_start = timing::Clock::now();
-    for (int i = 0; i < out.results.count; ++i) {
-        const auto& res = out.results.results[i];
-        int left = align_down_even(clamp_to_range(res.box.left, 0, out.width - 2));
-        int top = align_down_even(clamp_to_range(res.box.top, 0, out.height - 2));
-        int right = align_up_even(clamp_to_range(res.box.right, left + 2, out.width));
-        int bottom = align_up_even(clamp_to_range(res.box.bottom, top + 2, out.height));
-        int rect_w = right - left;
-        int rect_h = bottom - top;
-        if (rect_w < 2 || rect_h < 2) {
-            continue;
-        }
-
-        im_rect rect = {left, top, rect_w, rect_h};
-        status = imrectangle(img, rect, 0x0000ff00, 4);
-        if (status != IM_STATUS_SUCCESS) {
-            printf("RGA 画框失败: %s\n", imStrError(status));
-        } else {
-            drawn_boxes++;
-        }
-    }
-    auto draw_end = timing::Clock::now();
-
-    auto push_start = timing::Clock::now();
-    if (!m_encoder->PushBuffer(out.src_buffer)) 
-    {
-        release_source_buffer(out);
-        return;
-    }
-    auto push_end = timing::Clock::now();
-    //release_source_buffer(out);
-
-    timing::Log("encode_input ch=%d frame=%llu boxes=%d  draw_us=%lld enc_put_us=%lld total_us=%lld",
-                m_channel_id,
-                static_cast<unsigned long long>(out.frame_id),
-                drawn_boxes,
-                timing::UsBetween(draw_start, draw_end),
-                timing::UsBetween(push_start, push_end),
-                timing::UsBetween(total_start, timing::Clock::now()));
-}
-
 void VideoChannel::OnInferDropped()
 {
     if (m_inflight_frames.load() > 0) {

@@ -2,7 +2,6 @@
 
 #include <thread>
 #include <mutex>
-#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <vector>
@@ -13,7 +12,6 @@
 #include <rockchip/mpp_buffer.h>
 #include <rockchip/mpp_packet.h>
 #include "mpp_packet_impl.h"
-#include "dma_alloc.h"
 
 
 // 定义码流回调函数的类型
@@ -30,9 +28,6 @@ class RkMppEncoder
 public:
     RkMppEncoder();
     ~RkMppEncoder();
-    MppBuffer GetFreeBuffer();
-    int GetHorStride() const { return hor_stride_; }
-    int GetVerStride() const { return ver_stride_; }
 
     // 1. 初始化编码器 (设置宽高、像素格式、编码格式 H264/H265 等)
     bool Init(int width,
@@ -49,10 +44,6 @@ public:
     // 3. 启动编码线程
     bool Start();
 
-    // 4. 供上层调用的接口：压入一帧原始图像数据 (YUV/RGB)
-    // 内部会从空闲队列取一个 DRM buffer，将数据拷贝进去，然后送给硬件
-    bool PushFrame(const uint8_t* image_data, size_t data_size);//这个接口非0拷贝，不考虑使用
-    
     bool PushBuffer(MppBuffer buffer, int64_t input_submit_wall_ms = -1);
 
     void RecycleBuffer(MppBuffer buffer);
@@ -63,11 +54,7 @@ public:
     void Stop();
 
 private:
-    // 原 Demo 中的 enc_test_input 和 enc_test_output 逻辑移入这里
-    void InputThreadFunc();
     void OutputThreadFunc();
-    bool AllocateExternalBuffers(size_t frame_size, int count);
-    void ReleaseExternalBuffers();
     void RecycleEncodedFrame(MppFrame frame);
     void RemovePendingFrame(MppFrame frame);
     bool RecycleOldestPendingFrame();
@@ -75,12 +62,6 @@ private:
     void MaybeLogStats(const char* source);
 
 private:
-    struct EncoderExternalBuffer {
-        int fd;
-        void* ptr;
-        size_t size;
-    };
-
     struct PendingFrame {
         MppFrame frame = nullptr;
         int64_t input_submit_wall_ms = -1;
@@ -90,18 +71,15 @@ private:
     MppCtx ctx_;
     MppApi* mpi_;
     MppEncCfg cfg_;
-    MppBufferGroup buf_grp_;
 
     // 基础参数
     int width_;
     int height_;
     int hor_stride_;
     int ver_stride_;
-    size_t frame_size_;
     MppFrameFormat fmt_;
     
     // C++ 线程管理
-    std::thread input_thread_;
     std::thread output_thread_;
     std::atomic<bool> is_running_;
 
@@ -119,9 +97,6 @@ private:
     std::atomic<uint64_t> output_frame_count_;
     std::atomic<uint64_t> recycled_frame_count_;
 
-    // Buffer 管理：外部 DMA fd commit 到 MppBufferGroup，由 group 管空闲/占用
     std::deque<PendingFrame> pending_frames_;
-    std::vector<EncoderExternalBuffer> external_buffers_;
     std::mutex mtx_;
-    std::condition_variable cv_;
 };

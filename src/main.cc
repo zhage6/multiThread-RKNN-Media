@@ -1,14 +1,12 @@
 #include <stdio.h>
+#include <atomic>
 #include <chrono>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 #include <sys/time.h>
 
-#include "opencv2/core/core.hpp"
-#include "opencv2/highgui/highgui.hpp"
-#include "opencv2/imgproc/imgproc.hpp"
-#include <opencv2/videoio.hpp>
 #include "rkYolov5s.hpp"
 #include "rknnPool.hpp"
 #include "postprocess.h"
@@ -26,7 +24,6 @@ namespace dpool
 
 int main(int argc, char **argv)
 {
-    char *model_name = NULL;
     if (argc != 3 && argc != 7)
     {
         printf("Usage: %s <yolo.rknn> <face_yolo.rknn> [input0 input1 input2 input3]\n", argv[0]);
@@ -36,17 +33,15 @@ int main(int argc, char **argv)
     // 参数二，模型所在路径/The path where the model is located
     char* yolo_model = argv[1];
     char* face_model = argv[2];
-    // 参数三, 视频/摄像头
-    // char *video_path = argv[2];
  
     // 初始化rknn线程池/Initialize the rknn thread pool
     std::atomic<int> active_channels{4};
     int yoloThreadNum = 4;
     int faceThreadNum = 3;
     int in_flight_frames = 0;
-    rknnPool<rkYolov5s, input_data, InferOutput> testPool(yolo_model, yoloThreadNum, std::vector<int>{0,1});
+    rknnPool<rkYolov5s, input_data, InferOutput> yoloPool(yolo_model, yoloThreadNum, std::vector<int>{0,1});
     rknnPool<rkYolov5s, input_data, InferOutput> facePool(face_model, faceThreadNum, std::vector<int>{2});
-    if (testPool.init() != 0)
+    if (yoloPool.init() != 0)
     {
         printf("rknnPool init fail!\n");
         return -1;
@@ -56,7 +51,7 @@ int main(int argc, char **argv)
         printf("facePool init fail!\n");
         return -1;
     }
-    YoloModelAdapter yolo("yolo", &testPool);
+    YoloModelAdapter yolo("yolo", &yoloPool);
     YoloModelAdapter face("face_yolo", &facePool);
     MosaicComposer mosaic;
     std::vector<std::shared_ptr<VideoChannel>> channels;
@@ -117,10 +112,8 @@ int main(int argc, char **argv)
     }
     for (int i = 0; i < 4; ++i) {
         channels.push_back(std::make_unique<VideoChannel>(
-            i, input_urls[i], &pipeline, active_channels, &mosaic));
+            i, input_urls[i], &pipeline, active_channels));
     }
-//    channels.push_back(std::make_unique<VideoChannel>(4, "../test5.h264", &yolo,active_channels, &mosaic));
-//    channels.push_back(std::make_unique<VideoChannel>(5, "../test6.h264", &yolo,active_channels, &mosaic));
     
     
     

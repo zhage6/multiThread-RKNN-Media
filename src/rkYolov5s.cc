@@ -5,12 +5,6 @@
 #include <mutex>
 #include "rknn_api.h"
 #include "postprocess.h"
-#include "preprocess.h"
-
-#include "opencv2/core/core.hpp"
-#include "opencv2/highgui/highgui.hpp"
-#include "opencv2/imgproc/imgproc.hpp"
-
 #include "coreNum.hpp"
 #include "rkYolov5s.hpp"
 #include "TimingLogger.h"
@@ -80,18 +74,6 @@ static unsigned char *load_model(const char *filename, int *model_size)
 
     *model_size = size;
     return data;
-}
-
-static int saveFloat(const char *file_name, float *output, int element_size)
-{
-    FILE *fp;
-    fp = fopen(file_name, "w");
-    for (int i = 0; i < element_size; i++)
-    {
-        fprintf(fp, "%.6f\n", output[i]);
-    }
-    fclose(fp);
-    return 0;
 }
 
 rkYolov5s::rkYolov5s(const std::string &model_path)
@@ -246,15 +228,6 @@ int rkYolov5s::init(rknn_context *ctx_in, bool share_weight, int core_id)
     return 0;
 }
 
-int rkYolov5s::GetInputFd()
-{
-    if (input_mems[0] != nullptr) 
-    {
-        return input_mems[0]->fd;
-    }
-    return -1;
-}
-
 rknn_context *rkYolov5s::get_pctx()
 {
     return &ctx;
@@ -371,12 +344,6 @@ InferOutput rkYolov5s::infer(input_data data)
         &letterbox
     ); //相当于做了内存的不断覆盖
     auto rga_end = timing::Clock::now();
-
-    if (data.frame != nullptr) {
-        mpp_frame_deinit(&data.frame); //归还frame，但是buffer还没归还
-        data.frame = nullptr;
-    }
-    
 
     detect_result_group_t detect_result_group;
     memset(&detect_result_group, 0, sizeof(detect_result_group));

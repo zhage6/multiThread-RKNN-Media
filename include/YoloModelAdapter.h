@@ -25,14 +25,9 @@ public:
         return ModelResultType::Detection;
     }
 
-    bool Submit(const FrameContext& frame) override
-    {
-        return Submit(frame, ModelOutputCallback());
-    }
-
     bool Submit(const FrameContext& frame, ModelOutputCallback cb) override
     {
-        if (!pool_) 
+        if (!pool_ || !cb)
         {
             return false;
         }
@@ -44,32 +39,23 @@ public:
         data.height = frame.height;
         data.hor_stride = frame.hor_stride;
         data.ver_stride = frame.ver_stride;
-        data.frame = nullptr;
         data.channel_id = frame.channel_id;
         data.frame_id = frame.frame_id;
         data.pts_us = frame.pts_us;
         data.origin_wall_ms = frame.origin_wall_ms;
 
         size_t pending_before = PendingCount();
-        bool ok = false;
-        if (cb) 
+        bool ok = pool_->put(data, [this, cb = std::move(cb)](InferOutput infer_out) mutable
         {
-            ok = pool_->put(data, [this, cb = std::move(cb)](InferOutput infer_out) mutable
-            { 
-                ModelOutput output = ConvertOutput(std::move(infer_out));
-                timing::Log("model_output model=%s ch=%d frame=%llu pending_after=%zu boxes=%d",
-                            model_id_.c_str(),
-                            output.frame.channel_id,
-                            static_cast<unsigned long long>(output.frame.frame_id),
-                            PendingCount(),
-                            output.result.detections.count);
-                cb(std::move(output));
-            }) == 0;
-        } 
-        else 
-        {
-            ok = pool_->put(data) == 0;
-        }
+            ModelOutput output = ConvertOutput(std::move(infer_out));
+            timing::Log("model_output model=%s ch=%d frame=%llu pending_after=%zu boxes=%d",
+                        model_id_.c_str(),
+                        output.frame.channel_id,
+                        static_cast<unsigned long long>(output.frame.frame_id),
+                        PendingCount(),
+                        output.result.detections.count);
+            cb(std::move(output));
+        }) == 0;
         size_t pending_after = PendingCount();
 
         timing::Log("model_submit model=%s ch=%d frame=%llu ok=%d pending_before=%zu pending_after=%zu",
@@ -81,29 +67,6 @@ public:
                     pending_after);
 
         return ok;
-    }
-
-    bool TryGet(ModelOutput& output) override
-    {
-        if (!pool_) {
-            return false;
-        }
-
-        InferOutput infer_out;
-        if (pool_->get(infer_out) != 0) {
-            return false;
-        }
-
-        output = ConvertOutput(std::move(infer_out));
-
-        timing::Log("model_output model=%s ch=%d frame=%llu pending_after=%zu boxes=%d",
-                    model_id_.c_str(),
-                    output.frame.channel_id,
-                    static_cast<unsigned long long>(output.frame.frame_id),
-                    PendingCount(),
-                    output.result.detections.count);
-
-        return true;
     }
 
     size_t PendingCount() const override

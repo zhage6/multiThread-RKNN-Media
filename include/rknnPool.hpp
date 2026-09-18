@@ -5,10 +5,10 @@
 #include <vector>
 #include <iostream>
 #include <mutex>
-#include <queue> 
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <thread>
 // rknnModel模型类, inputType模型输入类型, outputType模型输出类型
 template <typename rknnModel, typename inputType, typename outputType>
 class rknnPool
@@ -19,9 +19,8 @@ private:
     std::vector<int> coreIds;
 
     long long id;
-    std::mutex idMtx, queueMtx;
+    std::mutex idMtx;
     std::unique_ptr<dpool::ThreadPool> pool;//初始化线程池哦
-    std::queue<outputType> completed_outputs;
     std::atomic<int> pending_count{0};
     std::vector<std::shared_ptr<rknnModel>> models;
 
@@ -33,10 +32,7 @@ public:
     rknnPool(const std::string modelPath, int threadNum, std::vector<int> coreIds);
     int init();
     // 模型推理/Model inference
-    int put(inputType inputData);
     int put(inputType inputData, std::function<void(outputType)> onComplete);
-    // 获取推理结果/Get the results of your inference
-    int get(outputType &outputData);
     int get_task_size() 
     {
         return pending_count.load();
@@ -98,25 +94,6 @@ int rknnPool<rknnModel, inputType, outputType>::getModelId()
 }
 
 template <typename rknnModel, typename inputType, typename outputType>
-
-int rknnPool<rknnModel, inputType, outputType>::put(inputType inputData)
-{
-    auto model = models[this->getModelId()];
-    pending_count++;
-
-    pool->submit([this, model, inputData]() mutable 
-    {
-        outputType output = model->infer(inputData);
-        {
-            std::lock_guard<std::mutex> lock(queueMtx);
-            completed_outputs.push(std::move(output));
-        }
-    });
-
-    return 0;
-}
-
-template <typename rknnModel, typename inputType, typename outputType>
 int rknnPool<rknnModel, inputType, outputType>::put(inputType inputData, std::function<void(outputType)> onComplete)
 {
     auto model = models[this->getModelId()];
@@ -125,35 +102,9 @@ int rknnPool<rknnModel, inputType, outputType>::put(inputType inputData, std::fu
     pool->submit([this, model, inputData, onComplete = std::move(onComplete)]() mutable 
     {
         outputType output = model->infer(inputData);
-        if (onComplete) 
-        {
-            onComplete(std::move(output));
-        } 
-        else 
-        {
-            std::lock_guard<std::mutex> lock(queueMtx);
-            completed_outputs.push(std::move(output));
-            return;
-        }
-
+        onComplete(std::move(output));
         pending_count--;
     });
-
-    return 0;
-}
-
-template <typename rknnModel, typename inputType, typename outputType>
-int rknnPool<rknnModel, inputType, outputType>::get(outputType &outputData)
-{
-    std::lock_guard<std::mutex> lock(queueMtx);
-
-    if (completed_outputs.empty())
-    {
-        return 1;
-    }
-    outputData = std::move(completed_outputs.front());
-    completed_outputs.pop();
-    pending_count--;
 
     return 0;
 }
@@ -163,10 +114,7 @@ rknnPool<rknnModel, inputType, outputType>::~rknnPool()
 {
     while (pending_count.load() > 0)
     {
-        outputType temp;
-        if (get(temp) != 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 

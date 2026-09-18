@@ -10,14 +10,6 @@ namespace
 {
     constexpr int kMaxRenderBoxesPerModel = 3;
 
-    void release_source_buffer(const InferOutput& out)
-    {
-        if (out.src_buffer) 
-        {
-            mpp_buffer_put(out.src_buffer);
-        }
-    }
-
     int clamp_to_range(int value, int low, int high)
     {
         return std::max(low, std::min(value, high));
@@ -33,13 +25,6 @@ namespace
         return (value + 1) & ~1;
     }
 
-    bool is_local_stream_url(const std::string& url)
-    {
-        return url.rfind("rtsp://", 0) != 0 &&
-               url.rfind("rtmp://", 0) != 0 &&
-               url.rfind("http://", 0) != 0 &&
-               url.rfind("https://", 0) != 0;
-    }
     struct RenderStats 
     {
         int boxes = 0;
@@ -489,7 +474,6 @@ void MosaicComposer::ReleaseInput(MosaicInput& input)
     input.origin_wall_ms = -1;
     input.valid = false;
 
-    memset(&input.results, 0, sizeof(input.results));
     input.model_results.clear();
 }
 
@@ -649,11 +633,6 @@ void MosaicComposer::PruneExpiredInputsLocked(int64_t target_pts_us)
 }
 
 
-void MosaicComposer::Submit(const InferOutput& out)
-{
-    Submit(MakeYoloComposedFrame(out));
-}
-
 void MosaicComposer::Submit(const ComposedFrame& frame)
 {
     const FrameContext& ctx = frame.frame;
@@ -736,16 +715,6 @@ void MosaicComposer::Submit(const ComposedFrame& frame)
                 face_boxes,
                 yolo_boxes);
 
-    // 先兼容 YOLO：从 composed results 里找 Detection 结果
-
-    
-    memset(&input.results, 0, sizeof(input.results));
-    for (const auto& result : frame.results) {
-        if (result.type == ModelResultType::Detection && result.ok) {
-            input.results = result.detections;
-            break;
-        }
-    }
     if (ctx.pts_us >= 0)//按照pts放入通道
     {
         auto& buffer = pts_buffers_[ctx.channel_id];
@@ -1101,23 +1070,9 @@ void MosaicComposer::ComposeLocked()
         }
         if (status == IM_STATUS_SUCCESS && kDrawDetections) 
         {
-            if (!input.model_results.empty()) 
+            for (const auto& result : input.model_results)
             {
-                for (const auto& result : input.model_results) 
-                {
-                    RenderModelResult(result, input, dst_rect, render_batch, i);
-                }
-            } 
-            else 
-            {
-                // 兼容旧路径：如果还没有 model_results，就用旧 results 画 detection。
-                ModelResult legacy;
-                legacy.model_id = "legacy-yolo";
-                legacy.type = ModelResultType::Detection;
-                legacy.ok = true;
-                legacy.detections = input.results;
-
-                RenderModelResult(legacy, input, dst_rect, render_batch, i);
+                RenderModelResult(result, input, dst_rect, render_batch, i);
             }
         }
     }

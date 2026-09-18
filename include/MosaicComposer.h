@@ -12,7 +12,6 @@
 #include <thread>
 #include <map>
 #include <rockchip/mpp_buffer.h>
-#include "rkYolov5s.hpp"
 #include <vector>
 #include <deque>
 #include "dma_alloc.h"
@@ -39,7 +38,6 @@ struct MosaicInput
     int hor_stride = 0;
     int ver_stride = 0;
 
-    detect_result_group_t results;
     std::vector<ModelResult> model_results;
 };
 
@@ -57,8 +55,7 @@ public:
     ~MosaicComposer();
 
     bool Init(int out_width, int out_height, int fps);
-    void Submit(const InferOutput& out);
-    void Submit(const ComposedFrame& frame);// 新的submit为了多模型
+    void Submit(const ComposedFrame& frame);
     void Stop();
 
 private:

@@ -3,14 +3,9 @@
 
 #include "rknn_api.h"
 #include <mutex>
-#include "opencv2/core/core.hpp"
 #include "postprocess.h"
 #include "MppDecoder.h"
 
-static void dump_tensor_attr(rknn_tensor_attr *attr);
-static unsigned char *load_data(FILE *fp, size_t ofst, size_t sz);
-static unsigned char *load_model(const char *filename, int *model_size);
-static int saveFloat(const char *file_name, float *output, int element_size);
 struct input_data 
 {
     int src_fd;       // 解码器给的底层钥匙
@@ -19,7 +14,6 @@ struct input_data
     int height;       // 原图高
     int hor_stride;   // 宽步长
     int ver_stride;   // 高步长
-    MppFrame frame;
     // ======== 多路框架新增 ========
     int channel_id;      // 标记是哪一路视频
     uint64_t frame_id;   // 标记这路视频的第几帧 (用来排序)
@@ -68,11 +62,9 @@ private:
     float nms_threshold, box_conf_threshold;
 
 public:
-    int GetInputFd();
     rkYolov5s(const std::string &model_path);
     int init(rknn_context *ctx_in, bool isChild, int core_id = -1);
     rknn_context *get_pctx();
-    //cv::Mat infer(cv::Mat &ori_img);
     InferOutput infer(input_data data);
     ~rkYolov5s();
 };

@@ -6,7 +6,6 @@
 
 #include <rockchip/mpp_buffer.h>
 #include "postprocess.h"
-#include "rkYolov5s.hpp"
 
 using ModelId = std::string;
 
@@ -81,30 +80,3 @@ struct ComposedFrame
     bool partial = false;
     std::vector<ModelId> missing_models;
 };
-
-inline ComposedFrame MakeYoloComposedFrame(const InferOutput& out)
-{
-    ComposedFrame composed;
-
-    composed.frame.channel_id = out.channel_id;
-    composed.frame.frame_id = out.frame_id;
-    composed.frame.pts_us = out.pts_us;
-    composed.frame.origin_wall_ms = out.origin_wall_ms;
-    composed.frame.src_fd = out.src_fd;
-    composed.frame.src_buffer = out.src_buffer;
-    composed.frame.width = out.width;
-    composed.frame.height = out.height;
-    composed.frame.hor_stride = out.hor_stride;
-    composed.frame.ver_stride = out.ver_stride;
-
-    ModelResult result;
-    result.model_id = "yolo";
-    result.type = ModelResultType::Detection;
-    result.ok = true;
-    result.detections = out.results;
-
-    composed.results.push_back(result);
-    composed.partial = false;
-
-    return composed;
-}
